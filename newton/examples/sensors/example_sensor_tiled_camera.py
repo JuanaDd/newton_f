@@ -30,6 +30,7 @@ import random
 
 import OpenGL.GL as gl
 import warp as wp
+from PIL import Image
 from pxr import Usd
 
 import newton
@@ -100,7 +101,7 @@ def shape_index_to_random_rgb(
 
 
 class Example:
-    def __init__(self, viewer: ViewerGL):
+    def __init__(self, viewer: ViewerGL, device=None):
         self.num_worlds_per_row = 6
         self.num_worlds_per_col = 4
         self.num_worlds_total = self.num_worlds_per_row * self.num_worlds_per_col
@@ -169,10 +170,10 @@ class Example:
         builder.add_ground_plane()
         semantic_colors.append(SEMANTIC_COLOR_GROUND_PLANE)
 
-        self.model = builder.finalize()
+        self.model = builder.finalize(device=device)
         self.state = self.model.state()
 
-        self.semantic_colors = wp.array(semantic_colors, dtype=wp.uint32)
+        self.semantic_colors = wp.array(semantic_colors, dtype=wp.uint32, device=self.model.device)
 
         self.viewer.set_model(self.model)
 
@@ -236,6 +237,7 @@ class Example:
         self.viewer.begin_frame(0.0)
         self.viewer.log_state(self.state)
         self.viewer.end_frame()
+        self.save_image("output.png")
 
     def render_sensors(self):
         self.tiled_camera_sensor.render(
@@ -318,6 +320,7 @@ class Example:
                 self.tiled_camera_sensor_shape_index_image.shape,
                 [self.tiled_camera_sensor_shape_index_image, self.semantic_colors],
                 [self.tiled_camera_sensor_shape_index_image],
+                device=self.model.device,
             )
             self.tiled_camera_sensor.flatten_color_image_to_rgba(
                 self.tiled_camera_sensor_shape_index_image, texture_buffer, self.num_worlds_per_row
@@ -328,6 +331,7 @@ class Example:
                 self.tiled_camera_sensor_shape_index_image.shape,
                 [self.tiled_camera_sensor_shape_index_image],
                 [self.tiled_camera_sensor_shape_index_image],
+                device=self.model.device,
             )
             self.tiled_camera_sensor.flatten_color_image_to_rgba(
                 self.tiled_camera_sensor_shape_index_image, texture_buffer, self.num_worlds_per_row
@@ -350,6 +354,48 @@ class Example:
         gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
+    def save_image(self, filename="output.png"):
+        out_buffer = None
+        if self.image_output == 0:
+            out_buffer = self.tiled_camera_sensor.flatten_color_image_to_rgba(
+                self.tiled_camera_sensor_color_image, num_worlds_per_row=self.num_worlds_per_row
+            )
+        elif self.image_output == 1:
+            out_buffer = self.tiled_camera_sensor.flatten_depth_image_to_rgba(
+                self.tiled_camera_sensor_depth_image, num_worlds_per_row=self.num_worlds_per_row
+            )
+        elif self.image_output == 2:
+            out_buffer = self.tiled_camera_sensor.flatten_normal_image_to_rgba(
+                self.tiled_camera_sensor_normal_image, num_worlds_per_row=self.num_worlds_per_row
+            )
+        elif self.image_output == 3:
+            wp.launch(
+                shape_index_to_semantic_rgb,
+                self.tiled_camera_sensor_shape_index_image.shape,
+                [self.tiled_camera_sensor_shape_index_image, self.semantic_colors],
+                [self.tiled_camera_sensor_shape_index_image],
+                device=self.model.device,
+            )
+            out_buffer = self.tiled_camera_sensor.flatten_color_image_to_rgba(
+                self.tiled_camera_sensor_shape_index_image, num_worlds_per_row=self.num_worlds_per_row
+            )
+        elif self.image_output == 4:
+            wp.launch(
+                shape_index_to_random_rgb,
+                self.tiled_camera_sensor_shape_index_image.shape,
+                [self.tiled_camera_sensor_shape_index_image],
+                [self.tiled_camera_sensor_shape_index_image],
+                device=self.model.device,
+            )
+            out_buffer = self.tiled_camera_sensor.flatten_color_image_to_rgba(
+                self.tiled_camera_sensor_shape_index_image, num_worlds_per_row=self.num_worlds_per_row
+            )
+
+        if out_buffer:
+            img_data = out_buffer.numpy()
+            Image.fromarray(img_data, mode="RGBA").save(filename)
+            print(f"Saved image to {filename}")
+
     def test_final(self):
         self.render_sensors()
 
@@ -362,6 +408,7 @@ class Example:
         assert depth_image.min() < depth_image.max()
 
     def gui(self, ui):
+
         if ui.radio_button("Show Color Output", self.image_output == 0):
             self.image_output = 0
         if ui.radio_button("Show Depth Output", self.image_output == 1):
@@ -421,6 +468,6 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init()
 
     # Create viewer and run
-    example = Example(viewer)
+    example = Example(viewer, device=args.device)
 
     newton.examples.run(example, args)

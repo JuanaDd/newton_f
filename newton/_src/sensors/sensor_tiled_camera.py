@@ -247,13 +247,16 @@ class SensorTiledCamera:
 
     def __init__(self, model: Model, num_cameras: int, width: int, height: int, options: Options | None = None):
         self.model = model
+        self.device = model.device
 
         self.render_context = RenderContext(
-            width, height, False, False, True, True, self.model.num_worlds, num_cameras, True
+            width, height, False, False, True, True, self.model.num_worlds, num_cameras, True, device=self.device
         )
         self.render_context.mesh_ids = model.shape_source_ptr
-        self.render_context.shape_mesh_indices = wp.empty(self.model.shape_count, dtype=wp.int32)
-        self.render_context.mesh_bounds = wp.empty((self.model.shape_count, 2), dtype=wp.vec3f, ndim=2)
+        self.render_context.shape_mesh_indices = wp.empty(self.model.shape_count, dtype=wp.int32, device=self.device)
+        self.render_context.mesh_bounds = wp.empty(
+            (self.model.shape_count, 2), dtype=wp.vec3f, ndim=2, device=self.device
+        )
 
         if model.particle_q is not None and model.particle_q.shape[0]:
             self.render_context.particles_position = model.particle_q
@@ -264,19 +267,21 @@ class SensorTiledCamera:
                 self.render_context.triangle_indices = model.tri_indices.flatten()
                 self.render_context.enable_particles = False
 
-        self.render_context.shape_enabled = wp.empty(self.model.shape_count, dtype=wp.uint32)
+        self.render_context.shape_enabled = wp.empty(self.model.shape_count, dtype=wp.uint32, device=self.device)
         self.render_context.shape_types = model.shape_type
-        self.render_context.shape_sizes = wp.empty(self.model.shape_count, dtype=wp.vec3f)
-        self.render_context.shape_transforms = wp.empty(self.model.shape_count, dtype=wp.transformf)
+        self.render_context.shape_sizes = wp.empty(self.model.shape_count, dtype=wp.vec3f, device=self.device)
+        self.render_context.shape_transforms = wp.empty(
+            self.model.shape_count, dtype=wp.transformf, device=self.device
+        )
         self.render_context.shape_materials = wp.array(
-            np.full(self.model.shape_count, fill_value=-1, dtype=np.int32), dtype=wp.int32
+            np.full(self.model.shape_count, fill_value=-1, dtype=np.int32), dtype=wp.int32, device=self.device
         )
         self.render_context.shape_colors = wp.array(
-            np.full((self.model.shape_count, 4), fill_value=1.0, dtype=wp.float32), dtype=wp.vec4f
+            np.full((self.model.shape_count, 4), fill_value=1.0, dtype=wp.float32), dtype=wp.vec4f, device=self.device
         )
         self.render_context.shape_world_index = self.model.shape_world
 
-        num_enabled_shapes = wp.zeros(1, dtype=wp.int32)
+        num_enabled_shapes = wp.zeros(1, dtype=wp.int32, device=self.device)
         wp.launch(
             kernel=compute_enabled_shapes,
             dim=self.model.shape_count,
@@ -287,6 +292,7 @@ class SensorTiledCamera:
                 self.render_context.shape_mesh_indices,
                 num_enabled_shapes,
             ],
+            device=self.device,
         )
         self.render_context.num_shapes = int(num_enabled_shapes.numpy()[0])
 
@@ -294,6 +300,7 @@ class SensorTiledCamera:
             kernel=compute_mesh_bounds,
             dim=self.model.shape_count,
             inputs=[self.render_context.mesh_ids, self.render_context.mesh_bounds],
+            device=self.device,
         )
 
         if options is not None:
@@ -325,6 +332,7 @@ class SensorTiledCamera:
                     self.render_context.shape_transforms,
                     self.render_context.shape_sizes,
                 ],
+                device=self.device,
             )
 
         if self.render_context.has_triangle_mesh:
@@ -394,21 +402,25 @@ class SensorTiledCamera:
         """
 
         camera_rays = wp.empty(
-            (self.render_context.num_cameras, self.render_context.height, self.render_context.width, 2), dtype=wp.vec3f
+            (self.render_context.num_cameras, self.render_context.height, self.render_context.width, 2),
+            dtype=wp.vec3f,
+            device=self.device,
         )
 
         if isinstance(camera_fovs, float):
-            camera_fovs = wp.array([camera_fovs] * self.render_context.num_cameras, dtype=wp.float32)
+            camera_fovs = wp.array(
+                [camera_fovs] * self.render_context.num_cameras, dtype=wp.float32, device=self.device
+            )
         elif isinstance(camera_fovs, list):
             assert len(camera_fovs) == self.render_context.num_cameras, (
                 "Length of camera_fovs does not match the number of cameras"
             )
-            camera_fovs = wp.array(camera_fovs, dtype=wp.float32)
+            camera_fovs = wp.array(camera_fovs, dtype=wp.float32, device=self.device)
         elif isinstance(camera_fovs, np.ndarray):
             assert camera_fovs.size == self.render_context.num_cameras, (
                 "Length of camera_fovs does not match the number of cameras"
             )
-            camera_fovs = wp.array(camera_fovs, dtype=wp.float32)
+            camera_fovs = wp.array(camera_fovs, dtype=wp.float32, device=self.device)
 
         wp.launch(
             kernel=compute_pinhole_camera_rays,
@@ -419,6 +431,7 @@ class SensorTiledCamera:
                 camera_fovs,
                 camera_rays,
             ],
+            device=self.device,
         )
 
         return camera_rays
@@ -430,10 +443,18 @@ class SensorTiledCamera:
         num_worlds_per_col = math.ceil(num_worlds_and_cameras / num_worlds_per_row)
 
         if out_buffer is None:
-            return wp.empty(
-                (num_worlds_per_col * self.render_context.height, num_worlds_per_row * self.render_context.width, 4),
-                dtype=wp.uint8,
-            ), num_worlds_per_row
+            return (
+                wp.empty(
+                    (
+                        num_worlds_per_col * self.render_context.height,
+                        num_worlds_per_row * self.render_context.width,
+                        4,
+                    ),
+                    dtype=wp.uint8,
+                    device=self.device,
+                ),
+                num_worlds_per_row,
+            )
 
         return out_buffer.reshape(
             (num_worlds_per_col * self.render_context.height, num_worlds_per_row * self.render_context.width, 4)
@@ -475,6 +496,7 @@ class SensorTiledCamera:
                 self.render_context.num_cameras,
                 num_worlds_per_row,
             ],
+            device=self.device,
         )
         return out_buffer
 
@@ -514,6 +536,7 @@ class SensorTiledCamera:
                 self.render_context.num_cameras,
                 num_worlds_per_row,
             ],
+            device=self.device,
         )
         return out_buffer
 
@@ -538,8 +561,8 @@ class SensorTiledCamera:
 
         out_buffer, num_worlds_per_row = self.__reshape_buffer_for_flatten(out_buffer, num_worlds_per_row)
 
-        depth_range = wp.array([100000000.0, 0.0], dtype=wp.float32)
-        wp.launch(find_depth_range, image.shape, [image, depth_range])
+        depth_range = wp.array([100000000.0, 0.0], dtype=wp.float32, device=self.device)
+        wp.launch(find_depth_range, image.shape, [image, depth_range], device=self.device)
         wp.launch(
             flatten_depth_image,
             (
@@ -557,6 +580,7 @@ class SensorTiledCamera:
                 self.render_context.num_cameras,
                 num_worlds_per_row,
             ],
+            device=self.device,
         )
         return out_buffer
 
@@ -571,7 +595,7 @@ class SensorTiledCamera:
         colors = np.random.default_rng(seed).random((self.model.shape_count, 4)) * 0.5 + 0.5
         colors[:, -1] = 1.0
         self.render_context.shape_colors = wp.array(
-            colors[self.model.shape_world.numpy() % len(colors)], dtype=wp.vec4f
+            colors[self.model.shape_world.numpy() % len(colors)], dtype=wp.vec4f, device=self.device
         )
 
     def assign_random_colors_per_shape(self, seed: int = 100):
@@ -584,7 +608,7 @@ class SensorTiledCamera:
 
         colors = np.random.default_rng(seed).random((self.model.shape_count, 4)) * 0.5 + 0.5
         colors[:, -1] = 1.0
-        self.render_context.shape_colors = wp.array(colors, dtype=wp.vec4f)
+        self.render_context.shape_colors = wp.array(colors, dtype=wp.vec4f, device=self.device)
 
     def create_default_light(self, enable_shadows: bool = True):
         """
@@ -594,12 +618,12 @@ class SensorTiledCamera:
         """
 
         self.render_context.enable_shadows = enable_shadows
-        self.render_context.lights_active = wp.array([True], dtype=wp.bool)
-        self.render_context.lights_type = wp.array([RenderLightType.DIRECTIONAL], dtype=wp.int32)
-        self.render_context.lights_cast_shadow = wp.array([True], dtype=wp.bool)
-        self.render_context.lights_position = wp.array([wp.vec3f(0.0)], dtype=wp.vec3f)
+        self.render_context.lights_active = wp.array([True], dtype=wp.bool, device=self.device)
+        self.render_context.lights_type = wp.array([RenderLightType.DIRECTIONAL], dtype=wp.int32, device=self.device)
+        self.render_context.lights_cast_shadow = wp.array([True], dtype=wp.bool, device=self.device)
+        self.render_context.lights_position = wp.array([wp.vec3f(0.0)], dtype=wp.vec3f, device=self.device)
         self.render_context.lights_orientation = wp.array(
-            [wp.vec3f(-0.57735026, 0.57735026, -0.57735026)], dtype=wp.vec3f
+            [wp.vec3f(-0.57735026, 0.57735026, -0.57735026)], dtype=wp.vec3f, device=self.device
         )
 
     def assign_checkerboard_material_to_all_shapes(self, resolution: int = 64, checker_size: int = 32):
@@ -620,17 +644,17 @@ class SensorTiledCamera:
         pixels = np.where(checkerboard, 0xFF808080, 0xFFBFBFBF).astype(np.uint32).flatten()
 
         self.render_context.enable_textures = True
-        self.render_context.texture_data = wp.array(pixels, dtype=wp.uint32)
-        self.render_context.texture_offsets = wp.array([0], dtype=wp.int32)
-        self.render_context.texture_width = wp.array([resolution], dtype=wp.int32)
-        self.render_context.texture_height = wp.array([resolution], dtype=wp.int32)
+        self.render_context.texture_data = wp.array(pixels, dtype=wp.uint32, device=self.device)
+        self.render_context.texture_offsets = wp.array([0], dtype=wp.int32, device=self.device)
+        self.render_context.texture_width = wp.array([resolution], dtype=wp.int32, device=self.device)
+        self.render_context.texture_height = wp.array([resolution], dtype=wp.int32, device=self.device)
 
-        self.render_context.material_texture_ids = wp.array([0], dtype=wp.int32)
-        self.render_context.material_texture_repeat = wp.array([wp.vec2f(1.0)], dtype=wp.vec2f)
-        self.render_context.material_rgba = wp.array([wp.vec4f(1.0)], dtype=wp.vec4f)
+        self.render_context.material_texture_ids = wp.array([0], dtype=wp.int32, device=self.device)
+        self.render_context.material_texture_repeat = wp.array([wp.vec2f(1.0)], dtype=wp.vec2f, device=self.device)
+        self.render_context.material_rgba = wp.array([wp.vec4f(1.0)], dtype=wp.vec4f, device=self.device)
 
         self.render_context.shape_materials = wp.array(
-            np.full(self.model.shape_count, fill_value=0, dtype=np.int32), dtype=wp.int32
+            np.full(self.model.shape_count, fill_value=0, dtype=np.int32), dtype=wp.int32, device=self.device
         )
 
     def create_color_image_output(self):

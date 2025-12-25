@@ -407,4 +407,5 @@ def render_megakernel(
             shape_index_image,
             normal_image,
         ],
+        device=rc.device,
     )

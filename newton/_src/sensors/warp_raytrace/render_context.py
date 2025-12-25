@@ -21,6 +21,7 @@ import warp as wp
 
 from .bvh import compute_bvh_group_roots, compute_particle_bvh_bounds, compute_shape_bvh_bounds
 from .render import render_megakernel
+from warp.context import Devicelike
 
 
 @dataclass
@@ -48,11 +49,13 @@ class RenderContext:
         has_global_world: bool = False,
         tile_rendering: bool = False,
         tile_size: int = 8,
+        device: Devicelike | None = None,
     ):
         self.width = width
         self.height = height
         self.tile_rendering = tile_rendering
         self.tile_size = tile_size
+        self.device = device
         self.enable_textures = enable_textures
         self.enable_shadows = enable_shadows
         self.enable_ambient_lighting = enable_ambient_lighting
@@ -117,35 +120,35 @@ class RenderContext:
 
     def __init_shape_outputs(self):
         if self.bvh_shapes_lowers is None:
-            self.bvh_shapes_lowers = wp.zeros(self.num_shapes_total, dtype=wp.vec3f)
+            self.bvh_shapes_lowers = wp.zeros(self.num_shapes_total, dtype=wp.vec3f, device=self.device)
         if self.bvh_shapes_uppers is None:
-            self.bvh_shapes_uppers = wp.zeros(self.num_shapes_total, dtype=wp.vec3f)
+            self.bvh_shapes_uppers = wp.zeros(self.num_shapes_total, dtype=wp.vec3f, device=self.device)
         if self.bvh_shapes_groups is None:
-            self.bvh_shapes_groups = wp.zeros(self.num_shapes_total, dtype=wp.int32)
+            self.bvh_shapes_groups = wp.zeros(self.num_shapes_total, dtype=wp.int32, device=self.device)
         if self.bvh_shapes_group_roots is None:
-            self.bvh_shapes_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32)
+            self.bvh_shapes_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32, device=self.device)
 
     def __init_particle_outputs(self):
         if self.bvh_particles_lowers is None:
-            self.bvh_particles_lowers = wp.zeros(self.num_particles_total, dtype=wp.vec3f)
+            self.bvh_particles_lowers = wp.zeros(self.num_particles_total, dtype=wp.vec3f, device=self.device)
         if self.bvh_particles_uppers is None:
-            self.bvh_particles_uppers = wp.zeros(self.num_particles_total, dtype=wp.vec3f)
+            self.bvh_particles_uppers = wp.zeros(self.num_particles_total, dtype=wp.vec3f, device=self.device)
         if self.bvh_particles_groups is None:
-            self.bvh_particles_groups = wp.zeros(self.num_particles_total, dtype=wp.int32)
+            self.bvh_particles_groups = wp.zeros(self.num_particles_total, dtype=wp.int32, device=self.device)
         if self.bvh_particles_group_roots is None:
-            self.bvh_particles_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32)
+            self.bvh_particles_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32, device=self.device)
 
     def create_color_image_output(self):
-        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.uint32)
+        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.uint32, device=self.device)
 
     def create_depth_image_output(self):
-        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.float32)
+        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.float32, device=self.device)
 
     def create_shape_index_image_output(self):
-        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.uint32)
+        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.uint32, device=self.device)
 
     def create_normal_image_output(self):
-        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.vec3f)
+        return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.vec3f, device=self.device)
 
     def refit_bvh(self):
         if self.num_shapes_total:
@@ -157,6 +160,7 @@ class RenderContext:
                     kernel=compute_bvh_group_roots,
                     dim=self.num_worlds_total,
                     inputs=[self.bvh_shapes.id, self.bvh_shapes_group_roots],
+                    device=self.device,
                 )
             else:
                 self.bvh_shapes.refit()
@@ -174,6 +178,7 @@ class RenderContext:
                     kernel=compute_bvh_group_roots,
                     dim=self.num_worlds_total,
                     inputs=[self.bvh_particles.id, self.bvh_particles_group_roots],
+                    device=self.device,
                 )
             else:
                 self.bvh_particles.refit()
@@ -227,6 +232,7 @@ class RenderContext:
                 self.bvh_shapes_uppers,
                 self.bvh_shapes_groups,
             ],
+            device=self.device,
         )
 
     def __compute_bvh_particle_bounds(self):
@@ -243,6 +249,7 @@ class RenderContext:
                 self.bvh_particles_uppers,
                 self.bvh_particles_groups,
             ],
+            device=self.device,
         )
 
     @property
