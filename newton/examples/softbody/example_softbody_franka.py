@@ -45,8 +45,20 @@ def compute_joint_qd(
     out_qd[i] = (target_q[i] - current_q[i]) * inv_frame_dt
 
 
+@wp.kernel
+def broadcast_joints(
+    src: wp.array(dtype=float),
+    dst: wp.array(dtype=float),
+    stride: int,
+):
+    world_id, i = wp.tid()
+    dst[world_id * stride + i] = src[i]
+
+
 class Example:
     def __init__(self, viewer, args=None):
+        self.num_worlds = args.world_count if args is not None else 5
+
         # simulation parameters (meter scale)
         self.sim_substeps = 10
         self.iterations = 5
@@ -69,17 +81,16 @@ class Example:
 
         self.viewer = viewer
 
-        # create robot
-        franka = ModelBuilder()
-        self.create_articulation(franka)
-        self.scene.add_world(franka)
+        # --- Build per-world environment template ---
+        env_builder = ModelBuilder()
+        self.create_articulation(env_builder)
 
-        # add a table (meter scale)
+        # table (meter scale)
         table_hx = 0.4
         table_hy = 0.4
         table_hz = 0.1
         table_pos = wp.vec3(0.0, -0.5, 0.1)
-        self.scene.add_shape_box(
+        env_builder.add_shape_box(
             -1,
             wp.transform(table_pos, wp.quat_identity()),
             hx=table_hx,
@@ -93,12 +104,10 @@ class Example:
         prim = usd_stage.GetPrimAtPath("/root/Model/TetMesh")
         tetmesh = newton.TetMesh.create_from_usd(prim)
 
-        # Duck USDA is in meters (metersPerUnit=1.0).
-        # Table top is at z=0.2m. Duck center offset ~0.03m above table.
-        self.scene.add_soft_mesh(
+        env_builder.add_soft_mesh(
             pos=wp.vec3(0.0, -0.5, 0.23),
             rot=wp.quat_identity(),
-            scale=1.0,  # already in meters
+            scale=1.0,
             vel=wp.vec3(0.0, 0.0, 0.0),
             mesh=tetmesh,
             density=100.0,
@@ -108,10 +117,18 @@ class Example:
             particle_radius=self.particle_radius,
         )
 
-        self.scene.color()
-        self.scene.add_ground_plane()
+        self.ik_model = env_builder.finalize(requires_grad=False)
 
-        self.model = self.scene.finalize(requires_grad=False)
+        # --- Multi-world physics model ---
+        scene = ModelBuilder(gravity=-9.81)
+        scene.add_ground_plane()
+        scene.replicate(env_builder, world_count=self.num_worlds, spacing=(2.0, 2.0, 0.0))
+        scene.color()
+        self.model = scene.finalize(requires_grad=False)
+
+        # per-world joint dimensions (identical across worlds)
+        self.coords_per_world = self.ik_model.joint_coord_count
+        self.dofs_per_world = self.ik_model.joint_dof_count
 
         # contact material properties
         self.model.soft_contact_ke = self.soft_contact_ke
@@ -140,7 +157,7 @@ class Example:
         # robot solver (Featherstone as kinematic integrator for body velocities)
         self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
 
-        # IK solver setup
+        # IK solver setup (operates on single-world ik_model)
         self.set_up_ik()
 
         # soft body solver
@@ -157,11 +174,17 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
+        self.viewer.set_world_offsets((0.0, 0.0, 0.0))
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
 
-        # gravity arrays for swapping during simulation
-        self.gravity_zero = wp.zeros(1, dtype=wp.vec3)
-        self.gravity_earth = wp.array(wp.vec3(0.0, 0.0, -9.81), dtype=wp.vec3)
+        # gravity arrays for swapping during simulation (one vec3 per world)
+        wc = self.model.world_count
+        self.gravity_zero = wp.zeros(wc, dtype=wp.vec3)
+        self.gravity_earth = wp.array([wp.vec3(0.0, 0.0, -9.81)] * wc, dtype=wp.vec3)
+
+        # IK result buffer (single-world size), then broadcast to all worlds
+        self.target_joint_q_single = wp.zeros(self.coords_per_world, dtype=float)
+        self.target_joint_q = wp.zeros(self.model.joint_coord_count, dtype=float)
 
         # evaluate FK for initial state
         eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
@@ -171,24 +194,21 @@ class Example:
 
     def set_up_ik(self):
         """Set up GPU IK solver for end-effector pose tracking."""
-        # Evaluate FK to get initial EE transform
-        state = self.model.state()
-        eval_fk(self.model, self.model.joint_q, self.model.joint_qd, state)
+        state = self.ik_model.state()
+        eval_fk(self.ik_model, self.ik_model.joint_q, self.ik_model.joint_qd, state)
 
-        # IK joint coordinates (1 problem, all DOFs)
-        self.n_coords = self.model.joint_coord_count
-        self.n_dofs = self.model.joint_dof_count
-        self.ik_joint_q = wp.array(self.model.joint_q, shape=(1, self.n_coords))
+        # IK joint coordinates (1 problem, single-world size)
+        self.ik_joint_q = wp.array(self.ik_model.joint_q, shape=(1, self.coords_per_world))
 
-        # Finger DOF indices (last two)
-        self.finger_idx0 = self.n_coords - 2
-        self.finger_idx1 = self.n_coords - 1
+        # Finger DOF indices within single world
+        self.finger_idx0 = self.coords_per_world - 2
+        self.finger_idx1 = self.coords_per_world - 1
 
         # Finger position buffer (wp.array so it works with graph capture)
         self.finger_pos_buf = wp.zeros(1, dtype=float)
 
         # 1D buffer for IK result (target joint config)
-        self.target_joint_q = wp.zeros(self.n_coords, dtype=float)
+        self.target_joint_q = wp.zeros(self.coords_per_world, dtype=float)
 
         # Initial target from keyframe
         target_pos = wp.vec3(*self.targets[0][:3].tolist())
@@ -210,13 +230,13 @@ class Example:
 
         # Joint limit objective
         self.joint_limits_obj = ik.IKObjectiveJointLimit(
-            joint_limit_lower=self.model.joint_limit_lower,
-            joint_limit_upper=self.model.joint_limit_upper,
+            joint_limit_lower=self.ik_model.joint_limit_lower,
+            joint_limit_upper=self.ik_model.joint_limit_upper,
             weight=10.0,
         )
 
         self.ik_solver = ik.IKSolver(
-            model=self.model,
+            model=self.ik_model,
             n_problems=1,
             objectives=[self.pos_obj, self.rot_obj, self.joint_limits_obj],
             lambda_initial=0.1,
@@ -314,7 +334,7 @@ class Example:
             self.simulate()
 
     def simulate(self):
-        # IK solve once per frame (GPU, captured in graph)
+        # IK solve once per frame on single-world model
         self.ik_solver.step(self.ik_joint_q, self.ik_joint_q, iterations=self.ik_iters)
 
         # Set gripper finger positions from buffer
@@ -324,13 +344,20 @@ class Example:
             inputs=[self.ik_joint_q, self.finger_pos_buf, self.finger_idx0, self.finger_idx1],
         )
 
-        # Copy IK result to target buffer (2D -> 1D, contiguous memory)
-        wp.copy(self.target_joint_q, self.ik_joint_q, dest_offset=0, src_offset=0, count=self.n_coords)
+        # Copy IK result to single-world buffer (2D -> 1D)
+        wp.copy(self.target_joint_q_single, self.ik_joint_q, dest_offset=0, src_offset=0, count=self.coords_per_world)
 
-        # Compute joint velocity: qd = (target - current) / frame_dt
+        # Broadcast single-world IK result to all worlds
+        wp.launch(
+            broadcast_joints,
+            dim=(self.num_worlds, self.coords_per_world),
+            inputs=[self.target_joint_q_single, self.target_joint_q, self.coords_per_world],
+        )
+
+        # Compute joint velocity: qd = (target - current) / frame_dt (all worlds)
         wp.launch(
             compute_joint_qd,
-            dim=self.n_dofs,
+            dim=self.model.joint_dof_count,
             inputs=[self.target_joint_q, self.state_0.joint_q, self.target_joint_qd, 1.0 / self.frame_dt],
         )
 
@@ -372,8 +399,9 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        p_lower = wp.vec3(-0.5, -1.0, -0.05)
-        p_upper = wp.vec3(0.5, 0.0, 0.6)
+        # bounds expanded for multi-world physical spacing (2.0, 2.0, 0.0) centered grid
+        p_lower = wp.vec3(-3.0, -3.0, -0.05)
+        p_upper = wp.vec3(3.0, 2.0, 0.6)
         newton.examples.test_particle_state(
             self.state_0,
             "particles are within a reasonable volume",
@@ -395,6 +423,8 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.set_defaults(num_frames=1000)
+    newton.examples.add_world_count_arg(parser)
+    parser.set_defaults(world_count=5)
     viewer, args = newton.examples.init(parser)
 
     example = Example(viewer, args)
