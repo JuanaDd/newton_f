@@ -122,7 +122,7 @@ class Example:
         # --- Multi-world physics model ---
         scene = ModelBuilder(gravity=-9.81)
         scene.add_ground_plane()
-        scene.replicate(env_builder, world_count=self.num_worlds, spacing=(2.0, 2.0, 0.0))
+        scene.replicate(env_builder, world_count=self.num_worlds)
         scene.color()
         self.model = scene.finalize(requires_grad=False)
 
@@ -174,7 +174,7 @@ class Example:
         )
 
         self.viewer.set_model(self.model)
-        self.viewer.set_world_offsets((0.0, 0.0, 0.0))
+        self.viewer.set_world_offsets((1.5, 1.5, 0.0))
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
 
         # gravity arrays for swapping during simulation (one vec3 per world)
@@ -399,9 +399,8 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        # bounds expanded for multi-world physical spacing (2.0, 2.0, 0.0) centered grid
-        p_lower = wp.vec3(-3.0, -3.0, -0.05)
-        p_upper = wp.vec3(3.0, 2.0, 0.6)
+        p_lower = wp.vec3(-0.5, -1.0, -0.05)
+        p_upper = wp.vec3(0.5, 0.0, 0.6)
         newton.examples.test_particle_state(
             self.state_0,
             "particles are within a reasonable volume",

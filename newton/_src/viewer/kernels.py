@@ -167,6 +167,21 @@ def update_shape_xforms(
 
 
 @wp.kernel
+def apply_particle_world_offsets(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_world: wp.array(dtype=wp.int32),
+    world_offsets: wp.array(dtype=wp.vec3),
+    out_q: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    pos = particle_q[tid]
+    w = particle_world[tid]
+    if w >= 0 and w < world_offsets.shape[0]:
+        pos = pos + world_offsets[w]
+    out_q[tid] = pos
+
+
+@wp.kernel
 def repack_shape_colors(
     shape_colors: wp.array(dtype=wp.vec3),
     slot_to_shape: wp.array(dtype=wp.int32),

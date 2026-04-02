@@ -95,6 +95,9 @@ class ViewerBase(ABC):
         self.world_offsets = None
         self.max_worlds = None
 
+        # Scratch buffer for particle positions with world offsets applied
+        self._particle_q_offset: wp.array | None = None
+
         # Picking
         self.picking_enabled = True
 
@@ -1713,11 +1716,40 @@ class ViewerBase(ABC):
 
         self.log_points("/model/com", self._com_positions, self._com_radii, self._com_colors, hidden=not self.show_com)
 
+    def _get_particle_q_with_offsets(self, state: newton.State) -> wp.array:
+        """Return particle positions with viewer world offsets applied.
+
+        When world offsets are active and per-particle world indices are
+        available, a scratch buffer is used so that simulation positions
+        remain untouched.
+        """
+        if (
+            self.world_offsets is None
+            or self.model.particle_world is None
+            or self.model.world_count <= 1
+        ):
+            return state.particle_q
+
+        n = self.model.particle_count
+        if self._particle_q_offset is None or self._particle_q_offset.shape[0] < n:
+            self._particle_q_offset = wp.zeros(n, dtype=wp.vec3, device=self.device)
+
+        from .kernels import apply_particle_world_offsets  # noqa: PLC0415
+
+        wp.launch(
+            kernel=apply_particle_world_offsets,
+            dim=n,
+            inputs=[state.particle_q, self.model.particle_world, self.world_offsets],
+            outputs=[self._particle_q_offset],
+            device=self.device,
+        )
+        return self._particle_q_offset
+
     def _log_triangles(self, state: newton.State):
         if self.model.tri_count:
             self.log_mesh(
                 "/model/triangles",
-                state.particle_q,
+                self._get_particle_q_with_offsets(state),
                 self.model.tri_indices.flatten(),
                 hidden=not self.show_triangles,
                 backface_culling=False,
@@ -1725,7 +1757,6 @@ class ViewerBase(ABC):
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
-            # just set colors on first frame
             if self.model_changed:
                 colors = wp.full(shape=self.model.particle_count, value=wp.vec3(0.7, 0.6, 0.4), device=self.device)
             else:
@@ -1733,7 +1764,7 @@ class ViewerBase(ABC):
 
             self.log_points(
                 name="/model/particles",
-                points=state.particle_q,
+                points=self._get_particle_q_with_offsets(state),
                 radii=self.model.particle_radius,
                 colors=colors,
                 hidden=not self.show_particles,
