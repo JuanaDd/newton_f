@@ -13,6 +13,10 @@ wheels/
 .cache/
 .thumbs/
 
+# Local asset copies (large, per-developer)
+.assets/
+.mesh_cache/
+
 # Coverage reports
 .coverage
 .coverage.*

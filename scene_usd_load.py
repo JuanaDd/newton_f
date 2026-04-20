@@ -11,6 +11,7 @@ Usage:
 """
 
 import hashlib
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,17 @@ _MESH_CACHE_DIR = Path(__file__).parent / ".mesh_cache"
 SCENE_USD_PATH = (
     "/home/yvetted/project/genie_sim/source/geniesim/assets/background/popcorn/popcorn_1/background.usda"
 )
+
+
+def _mesh_cache_paths(scene_path: str, prim_path: str) -> tuple[Path, Path]:
+    """Compute ``(full_file, decimated_file)`` cache paths for a prim.
+
+    The hash is taken over ``"{scene_path}::{prim_path}"`` so entries are
+    stable across runs but scene- and prim-specific.
+    """
+    key = f"{scene_path}::{prim_path}"
+    h = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return _MESH_CACHE_DIR / f"{h}.full.npz", _MESH_CACHE_DIR / f"{h}.npz"
 
 
 def _try_load_cached_mesh(
@@ -51,12 +63,7 @@ def _try_load_cached_mesh(
     """
     if not _MESH_CACHE_DIR.is_dir():
         return None
-    key = f"{scene_path}::{prim_path}"
-    h = hashlib.sha256(key.encode()).hexdigest()[:16]
-
-    full_file = _MESH_CACHE_DIR / f"{h}.full.npz"
-    dec_file = _MESH_CACHE_DIR / f"{h}.npz"
-
+    full_file, dec_file = _mesh_cache_paths(scene_path, prim_path)
     candidates = [full_file, dec_file] if prefer_full else [dec_file, full_file]
     for cache_file in candidates:
         if cache_file.exists():
@@ -93,6 +100,61 @@ def _load_mesh_from_npz(cache_file: Path) -> newton.Mesh:
     if texture is not None:
         mesh.texture = texture
     return mesh
+
+
+def _save_mesh_to_npz(mesh: newton.Mesh, cache_file: Path) -> None:
+    """Serialize a :class:`newton.Mesh` to an ``.npz`` cache file.
+
+    Inverse of :func:`_load_mesh_from_npz`. Uses temp-file + atomic
+    ``rename`` so a concurrent reader never observes a half-written
+    file. ``color``/``roughness``/``metallic`` use the same sentinels
+    as the loader (empty array / -1), so the format round-trips.
+
+    Texture arrays (in-memory image data) are not written; only string
+    texture paths are persisted, matching what the loader can consume.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    indices = np.asarray(mesh.indices, dtype=np.int32)
+
+    color = mesh.color
+    color_arr = (
+        np.asarray(color, dtype=np.float32) if color is not None else np.zeros(0, dtype=np.float32)
+    )
+    roughness = np.float32(mesh._roughness if mesh._roughness is not None else -1.0)
+    metallic = np.float32(mesh._metallic if mesh._metallic is not None else -1.0)
+
+    kwargs: dict[str, np.ndarray] = {
+        "vertices": vertices,
+        "indices": indices,
+        "color": color_arr,
+        "roughness": roughness,
+        "metallic": metallic,
+    }
+    if mesh._normals is not None:
+        kwargs["normals"] = np.asarray(mesh._normals, dtype=np.float32)
+    if mesh._uvs is not None:
+        kwargs["uvs"] = np.asarray(mesh._uvs, dtype=np.float32)
+    if isinstance(mesh.texture, str) and mesh.texture:
+        kwargs["texture"] = np.asarray(mesh.texture)
+
+    _MESH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Write via a file handle in the same directory so (a) np.savez does not
+    # auto-append ``.npz`` to our temp name, and (b) ``Path.replace`` is a
+    # same-filesystem atomic rename.
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=_MESH_CACHE_DIR,
+        prefix=cache_file.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp_fh:
+        np.savez(tmp_fh, **kwargs)
+        tmp_path = Path(tmp_fh.name)
+    try:
+        tmp_path.replace(cache_file)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _compute_world_aabb_for_prim(
@@ -137,6 +199,7 @@ def load_scene(
     skip_visible_colliders: bool = False,
     prefer_full_cache: bool = True,
     use_cache: bool = True,
+    write_cache: bool = True,
     collider_aabb_filter: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[tuple[newton.Mesh, wp.transform]], list[tuple[newton.Mesh, wp.transform]]]:
     """Load visual meshes and collision shapes from a USD scene in one pass.
@@ -156,6 +219,12 @@ def load_scene(
             cached meshes (with UVs/texture) over decimated ones.
         use_cache: If ``False``, skip cache lookup entirely and always
             load from USD.
+        write_cache: If ``True`` (default), save freshly-loaded visual
+            meshes to ``<hash>.full.npz`` so subsequent runs hit the
+            disk cache. Has no effect on prims that already hit the
+            cache, nor on collider meshes. Set to ``False`` (together
+            with ``use_cache=False``) to leave the cache directory
+            completely untouched.
         collider_aabb_filter: Optional ``(lo, hi)`` world-space AABB. If
             provided, collider prims whose transformed mesh AABB does not
             intersect this box are dropped (neither registered on the
@@ -255,6 +324,13 @@ def load_scene(
         else:
             mesh = newton.usd.get_mesh(prim, load_normals=True, load_uvs=True)
             tag = "loaded"
+            if write_cache:
+                full_file, _ = _mesh_cache_paths(scene_path, prim_path)
+                try:
+                    _save_mesh_to_npz(mesh, full_file)
+                    tag = "loaded+saved"
+                except Exception as e:
+                    print(f"    [warn] failed to write mesh cache for {prim_path}: {e}")
         visuals.append((mesh, xform))
         print(
             f"  visual ({tag}) {prim_path}: "

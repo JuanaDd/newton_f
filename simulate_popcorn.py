@@ -10,12 +10,14 @@ mapped into the machine box's world-space bounds.
 
 Usage:
     uv run python simulate_popcorn.py
-    uv run python simulate_popcorn.py --viewer rerun
+    uv run python simulate_popcorn.py --viewer null --num-frames 1000
     uv run python simulate_popcorn.py --record-mp4 ./popcorn.mp4
 """
 
+import contextlib
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -26,19 +28,19 @@ import newton.examples
 import newton.usd
 from newton.solvers import SolverImplicitMPM
 from video_recorder import VideoRecorder
-from visualize_scene_usd import (
+from scene_usd_load import (
     SCENE_USD_PATH,
     load_scene,
 )
 
-_ASSET_ROOT = "/home/yvetted/project/genie_sim/source/geniesim/assets"
+_ASSET_ROOT = str(Path(__file__).resolve().parent / ".assets" / "popcorn")
 
-POPCORN_USD_PATH = f"{_ASSET_ROOT}/background/common/popcorn/benchmark_popcorn_001/Aligned.usd"
+POPCORN_USD_PATH = f"{_ASSET_ROOT}/popcorn/Aligned.usd"
 POPCORN_PRIM_PATH = "/World/body/visual"
 
-SCOOP_USD_PATH = f"{_ASSET_ROOT}/background/common/benchmark_popcorn_scoop_001/Aligned.usd"
+SCOOP_USD_PATH = f"{_ASSET_ROOT}/scoop/Aligned.usd"
 
-BUCKET_USD_PATH = f"{_ASSET_ROOT}/objects/benchmark/popcorn_bucket/benchmark_popcorn_bucket_003/Aligned.usda"
+BUCKET_USD_PATH = f"{_ASSET_ROOT}/bucket/Aligned.usda"
 
 # ---------------------------------------------------------------------------
 # Extract particle emit bounds from PointInstancer
@@ -300,6 +302,87 @@ def set_body_transform_lerp_dual(
 
 
 # ---------------------------------------------------------------------------
+# FPS tracking
+# ---------------------------------------------------------------------------
+class _FpsTracker:
+    """Measures per-frame loop pacing and GPU physics-only time.
+
+    ``loop_ms`` is the wall-clock step-to-step delta and therefore reflects
+    the full outer loop (physics dispatch + render + any queue back-pressure).
+    ``phys_ms`` is the pure GPU time spent inside the physics dispatch,
+    measured with Warp CUDA events so it doesn't force a per-frame device
+    sync. Event pairs are drained on the log cadence where the oldest is
+    long since complete, keeping ``get_event_elapsed_time`` essentially free.
+    """
+
+    def __init__(self, device: wp.Device, log_interval: int = 60):
+        self._log_interval = log_interval
+        self._enable_phys_timing = device.is_cuda
+        self._frame_deltas: list[float] = []
+        self._last_start: float | None = None
+        self._phys_event_pairs: list[tuple[wp.Event, wp.Event]] = []
+        self._step_count = 0
+
+    def record_loop_delta(self) -> None:
+        """Stamp the CPU step-to-step clock at the start of each step."""
+        now = time.perf_counter()
+        if self._last_start is not None:
+            self._frame_deltas.append(now - self._last_start)
+        self._last_start = now
+
+    @contextlib.contextmanager
+    def phys_scope(self):
+        """Bracket a physics dispatch with CUDA events (no-op on CPU)."""
+        if not self._enable_phys_timing:
+            yield
+            return
+        beg = wp.Event(enable_timing=True)
+        end = wp.Event(enable_timing=True)
+        wp.record_event(beg)
+        try:
+            yield
+        finally:
+            wp.record_event(end)
+            self._phys_event_pairs.append((beg, end))
+
+    def tick(self, sim_time: float) -> None:
+        """Bump the step counter and log an FPS line on the interval."""
+        self._step_count += 1
+        if self._step_count % self._log_interval != 0 or not self._frame_deltas:
+            return
+
+        recent = self._frame_deltas[-self._log_interval:]
+        avg_frame = sum(recent) / len(recent)
+        loop_fps = 1.0 / avg_frame if avg_frame > 0 else float("inf")
+
+        total = sum(self._frame_deltas)
+        overall_fps = len(self._frame_deltas) / total if total > 0 else 0.0
+
+        phys_ms = self._drain_phys_events()
+        header = (
+            f"[step {self._step_count:>5d}] "
+            f"sim_t={sim_time:.2f}s | "
+            f"loop={avg_frame * 1000:.1f}ms ({loop_fps:.1f} FPS)"
+        )
+        tail = f" | avg {overall_fps:.1f}"
+        if phys_ms is not None:
+            phys_fps = 1000.0 / phys_ms if phys_ms > 0 else float("inf")
+            print(f"{header} | phys={phys_ms:.1f}ms ({phys_fps:.1f} FPS){tail}")
+        else:
+            print(f"{header}{tail}")
+
+    def _drain_phys_events(self) -> float | None:
+        """Average GPU physics time (ms) across all queued event pairs."""
+        if not self._phys_event_pairs:
+            return None
+        elapsed = [
+            wp.get_event_elapsed_time(b, e) for b, e in self._phys_event_pairs
+        ]
+        self._phys_event_pairs.clear()
+        return sum(elapsed) / len(elapsed)
+
+
+# ---------------------------------------------------------------------------
 # Example
 # ---------------------------------------------------------------------------
 class Example:
@@ -508,6 +591,7 @@ class Example:
             skip_visible_colliders=True,
             prefer_full_cache=prefer_full,
             use_cache=use_cache,
+            write_cache=use_cache,
             collider_aabb_filter=(filter_lo, filter_hi),
         )
 
@@ -587,11 +671,7 @@ class Example:
             d = np.array((-1.0, 0.0, 0.3))
             self.viewer.renderer._sun_direction = d / np.linalg.norm(d)
 
-        # FPS tracking
-        self._step_count = 0
-        self._fps_log_interval = 60
-        self._frame_deltas: list[float] = []
-        self._last_step_start_time: float | None = None
+        self._fps = _FpsTracker(self.model.device, log_interval=60)
 
         self.recorder = VideoRecorder.from_options(
             self.viewer, int(self.fps), options,
@@ -650,11 +730,18 @@ class Example:
         self.solver.update_particle_frames(self.state_0, self.state_0, self.frame_dt)
 
     def step(self):
-        now = time.perf_counter()
-        if self._last_step_start_time is not None:
-            self._frame_deltas.append(now - self._last_step_start_time)
-        self._last_step_start_time = now
+        self._fps.record_loop_delta()
 
+        with self._fps.phys_scope():
+            self._dispatch_gpu_frame()
+
+        self._fps.tick(self.sim_time)
+
+        self.sim_time += self.frame_dt
+        self._check_trajectory_end()
+
+    def _dispatch_gpu_frame(self) -> None:
+        """Launch one frame's GPU work: scooper keyframe eval + physics."""
         wp.launch(
             eval_trajectory_pair,
             dim=1,
@@ -672,27 +759,13 @@ class Example:
         else:
             self.simulate()
 
-        self._step_count += 1
-        if self._step_count % self._fps_log_interval == 0 and self._frame_deltas:
-            n = self._fps_log_interval
-            recent = self._frame_deltas[-n:]
-            avg_frame = sum(recent) / len(recent)
-            fps = 1.0 / avg_frame if avg_frame > 0 else float("inf")
-
-            total = sum(self._frame_deltas)
-            overall_fps = len(self._frame_deltas) / total if total > 0 else 0.0
-
-            print(
-                f"[step {self._step_count:>5d}] "
-                f"sim_t={self.sim_time:.2f}s | "
-                f"frame={avg_frame * 1000:.1f}ms | "
-                f"FPS: {fps:.1f} (avg {overall_fps:.1f})"
-            )
-
-        self.sim_time += self.frame_dt
-
+    def _check_trajectory_end(self) -> None:
+        """Close the viewer once the scripted scooper motion has played out."""
         if self.recorder and self.sim_time >= self._trajectory_end_time:
-            print(f"Trajectory finished at sim_time={self.sim_time:.2f}s, stopping recording.")
+            print(
+                f"Trajectory finished at sim_time={self.sim_time:.2f}s, "
+                "stopping recording."
+            )
             self.viewer.close()
 
     def _render_popcorn(self):
@@ -766,7 +839,7 @@ if __name__ == "__main__":
              "(with UVs/texture), 'decimated' = low-poly cached meshes "
              "(fast, no texture), 'none' = load directly from USD (slowest)",
     )
-    parser.add_argument("--young-modulus", type=float, default=1.0e5,
+    parser.add_argument("--young-modulus", type=float, default=1.0e6,
                         help="Young's modulus for popcorn particles [Pa]")
     parser.add_argument("--yield-stress", type=float, default=100.0,
                         help="Yield stress for popcorn particles [Pa]")
