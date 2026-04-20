@@ -974,7 +974,18 @@ def get_mesh(
                 cos_thresh = np.cos(np.deg2rad(vertex_splitting_angle_threshold_deg))
 
                 # For each original vertex v, we'll keep a list of clusters:
-                # each cluster stores (sum_dir, count, new_vid)
+                # each cluster stores [sum_dir, count, new_vid, uv_ref].
+                # ``uv_ref`` is the representative UV for the cluster when
+                # UVs are faceVarying (so corners that share a position and
+                # normal but differ in UV — e.g. UV seams on a car body —
+                # end up in separate clusters / new vertices). For other UV
+                # interpolations (or when UVs aren't loaded), ``uv_ref`` is
+                # None and UV does not influence cluster matching.
+                fv_uvs = uvs is not None and uvs_interpolation == UsdGeom.Tokens.faceVarying
+                # UV seams are authored with discrete, well-separated values;
+                # a tight absolute tolerance avoids false merges without
+                # being sensitive to float32 round-trip through USD.
+                uv_eps = 1e-5
                 clusters_per_v = [[] for _ in range(V)]
 
                 new_points = []
@@ -987,10 +998,11 @@ def get_mesh(
                     new_vid = len(new_points)
                     new_points.append(points[v])
                     new_norm_sums.append(n_dir.copy())
-                    clusters_per_v[v].append([n_dir.copy(), 1, new_vid])
+                    uv_ref = uvs[corner_idx] if fv_uvs else None
+                    clusters_per_v[v].append([n_dir.copy(), 1, new_vid, uv_ref])
                     if new_uvs is not None:
                         # Use corner UV if faceVarying, otherwise use vertex UV
-                        if uvs_interpolation == UsdGeom.Tokens.faceVarying:
+                        if fv_uvs:
                             new_uvs.append(uvs[corner_idx])
                         else:
                             new_uvs.append(uvs[v])
@@ -1000,22 +1012,28 @@ def get_mesh(
                 for c in range(C):
                     v = int(indices[c])
                     n_dir = Ndir[c]
+                    corner_uv = uvs[c] if fv_uvs else None
 
                     clusters = clusters_per_v[v]
                     assigned = False
                     # try to match an existing cluster
                     for cl in clusters:
-                        sum_dir, cnt, new_vid = cl
+                        sum_dir, cnt, new_vid, uv_ref = cl[0], cl[1], cl[2], cl[3]
                         # compare with current mean direction (sum_dir normalized)
                         mean_dir = sum_dir / max(np.linalg.norm(sum_dir), 1e-30)
-                        if float(np.dot(mean_dir, n_dir)) >= cos_thresh:
-                            # assign to this cluster
-                            cl[0] = sum_dir + n_dir
-                            cl[1] = cnt + 1
-                            new_norm_sums[new_vid] += n_dir
-                            new_indices[c] = new_vid
-                            assigned = True
-                            break
+                        if float(np.dot(mean_dir, n_dir)) < cos_thresh:
+                            continue
+                        if fv_uvs and (
+                            abs(float(corner_uv[0]) - float(uv_ref[0])) > uv_eps
+                            or abs(float(corner_uv[1]) - float(uv_ref[1])) > uv_eps
+                        ):
+                            continue
+                        cl[0] = sum_dir + n_dir
+                        cl[1] = cnt + 1
+                        new_norm_sums[new_vid] += n_dir
+                        new_indices[c] = new_vid
+                        assigned = True
+                        break
 
                     if not assigned:
                         new_vid = _new_vertex_from(v, n_dir, c)

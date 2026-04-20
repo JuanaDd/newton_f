@@ -7501,6 +7501,122 @@ def Mesh "cube"
         lengths = np.linalg.norm(normals, axis=1)
         np.testing.assert_allclose(lengths, 1.0, atol=1e-5)
 
+    # Two flat triangles sharing two positions, with faceVarying normals
+    # (all +Z → would be merged by vertex_splitting on normals alone) AND
+    # faceVarying UVs that place a seam at vertex 2: the two corners on
+    # vertex 2 carry different UVs. The loader must split vertex 2 along
+    # the UV seam so each corner keeps its authored UV.
+    QUAD_WITH_FACEVARYING_UV_SEAM = """#usda 1.0
+(
+    upAxis = "Y"
+)
+
+def Mesh "quad"
+{
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 2, 1, 3]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)]
+    normal3f[] primvars:normals = [
+        (0, 0, 1), (0, 0, 1), (0, 0, 1),
+        (0, 0, 1), (0, 0, 1), (0, 0, 1)
+    ] (
+        interpolation = "faceVarying"
+    )
+    texCoord2f[] primvars:st = [
+        (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+        (0.5, 0.5), (1.0, 0.0), (1.0, 1.0)
+    ] (
+        interpolation = "faceVarying"
+    )
+}
+"""
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_facevarying_uv_seam_splits_vertex(self):
+        """A UV seam on a corner that shares a position and normal with
+        another corner must split the shared vertex so each corner keeps
+        its authored UV (regression for the car-body UV seam bug).
+        """
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(self.QUAD_WITH_FACEVARYING_UV_SEAM)
+        prim = stage.GetPrimAtPath("/quad")
+
+        mesh = usd.get_mesh(prim, load_normals=True, load_uvs=True)
+
+        self.assertIsNotNone(mesh.uvs)
+        verts = np.asarray(mesh.vertices)
+        uvs = np.asarray(mesh.uvs)
+        tris = np.asarray(mesh.indices).reshape(-1, 3)
+
+        # Vertex 2 has two corners with different UVs → must be split; the
+        # other three original positions each contribute exactly one output
+        # vertex (vertex 1 has two corners with *identical* UVs so should
+        # not be duplicated).
+        self.assertEqual(len(verts), 5)
+
+        # For every triangle corner, the output UV must match the authored
+        # per-corner UV (the key invariant the seam fix protects).
+        fv_uvs = np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.5, 0.5],
+                [1.0, 0.0],
+                [1.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        fv_pos_idx = np.array([0, 1, 2, 2, 1, 3])
+        original_points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=np.float32)
+        for c in range(6):
+            out_vid = int(tris.reshape(-1)[c])
+            np.testing.assert_allclose(uvs[out_vid], fv_uvs[c], atol=1e-6)
+            np.testing.assert_allclose(verts[out_vid], original_points[fv_pos_idx[c]], atol=1e-6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_facevarying_uv_without_seam_does_not_split(self):
+        """When faceVarying UVs are continuous across a shared vertex,
+        vertex_splitting should still merge it by normal (no over-split).
+        """
+        from pxr import Usd
+
+        # Same quad, but corner 3 UV matches corner 2 (no seam on vertex 2).
+        usda = """#usda 1.0
+(
+    upAxis = "Y"
+)
+
+def Mesh "quad"
+{
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 2, 1, 3]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)]
+    normal3f[] primvars:normals = [
+        (0, 0, 1), (0, 0, 1), (0, 0, 1),
+        (0, 0, 1), (0, 0, 1), (0, 0, 1)
+    ] (
+        interpolation = "faceVarying"
+    )
+    texCoord2f[] primvars:st = [
+        (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+        (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)
+    ] (
+        interpolation = "faceVarying"
+    )
+}
+"""
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(usda)
+        prim = stage.GetPrimAtPath("/quad")
+
+        mesh = usd.get_mesh(prim, load_normals=True, load_uvs=True)
+        # All 4 original positions compact to 4 output vertices: no seam →
+        # shared corners merge, and the flat quad stays topologically intact.
+        self.assertEqual(len(mesh.vertices), 4)
+
 
 class TestTetMesh(unittest.TestCase):
     def test_tetmesh_basic(self):
