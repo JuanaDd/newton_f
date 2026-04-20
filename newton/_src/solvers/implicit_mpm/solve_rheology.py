@@ -438,6 +438,7 @@ class _RheologySolver:
         self.device = self.momentum.velocity.device
 
         self.delta_stress = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.delta_stress.zero_()
         self.strain_residual = fem.borrow_temporary(
             temporary_store, shape=(self.size,), dtype=float, device=self.device
         )
