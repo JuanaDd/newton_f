@@ -650,6 +650,9 @@ class SolverImplicitMPM(SolverBase):
         """Numerical drag for the background air."""
 
         # experimental
+        sdf_sign_from_average_normal: bool = True
+        """If true, determine the sign of the SDF from the average normal of the faces around the
+        closest point. Otherwise use Warp's default sign determination strategy (raycasts)."""
         collider_normal_from_sdf_gradient: bool = False
         """Compute collider normals from sdf gradient rather than closest point"""
         collider_basis: str = "Q1"

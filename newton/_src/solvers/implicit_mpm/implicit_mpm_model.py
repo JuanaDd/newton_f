@@ -283,6 +283,7 @@ class ImplicitMPMModel:
 
         self.collider = Collider()
         """Collider struct"""
+        self.collider.sdf_sign_from_average_normal = int(options.sdf_sign_from_average_normal)
 
         self.material_parameters = MaterialParameters()
         """Material parameters struct"""

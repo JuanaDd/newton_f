@@ -72,6 +72,10 @@ class Collider:
     query_max_dist: float
     """Maximum distance to query collider sdf"""
 
+    sdf_sign_from_average_normal: int
+    """If nonzero, determine the sign of the SDF from the average normal of the faces around the
+    closest point. Otherwise use Warp's default sign determination strategy (raycasts)."""
+
 
 @wp.func
 def get_average_face_normal(
@@ -142,7 +146,7 @@ def collision_sdf(
 
         max_dist = collider.query_max_dist + thickness
 
-        if wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
+        if collider.sdf_sign_from_average_normal != 0:
             query = wp.mesh_query_point_no_sign(mesh, x_local, max_dist)
         else:
             query = wp.mesh_query_point(mesh, x_local, max_dist)
@@ -150,7 +154,7 @@ def collision_sdf(
         if query.result:
             cp = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
 
-            if wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
+            if collider.sdf_sign_from_average_normal != 0:
                 face_normal = get_average_face_normal(mesh, cp)
                 sign = wp.where(wp.dot(face_normal, x_local - cp) > 0.0, 1.0, -1.0)
             else:
