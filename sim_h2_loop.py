@@ -11,10 +11,15 @@
 # ball joint at each end, closing six loops:
 #   - 2x ankle (A-crank drives the passive ankle pitch, rod ~371 mm)
 #   - 2x knee (knee motor four-bar, rod ~172 mm)
-#   - 2x waist (L/R torso constraint rods, ~65 mm, lock torso pitch/roll)
+#   - 2x waist (L/R torso constraint rods, ~65 mm, passive support; the
+#     rockers act as crank arms when the waist is driven)
 #
 # The pelvis is fixed in the air; ankle A-cranks and knee motors are driven
-# with sinusoids while knees/ankle pitches are passive linkage outputs.
+# with sinusoids while knees/ankle pitches are passive linkage outputs. The
+# waist rods are rigid and passive; waist motion comes either from driving
+# the rockers as crank arms (--drive waist/all, --waist-antiphase for pitch)
+# or from direct-driving waist_pitch (--waist-direct). Rod-end joint types
+# are selectable for ankle/knee: --ankle-rod ss|su, --knee-rod ss|rr|su.
 #
 # Command:
 #   uv run --extra examples python sim_h2_loop.py --viewer gl
@@ -156,21 +161,12 @@ def _quat_between(a: np.ndarray, b: np.ndarray) -> wp.quat:
     return wp.quat(float(cross[0] * inv), float(cross[1] * inv), float(cross[2] * inv), float(0.5 * scale))
 
 
-def _add_pushrod(builder: newton.ModelBuilder, b_a: int, p_a: np.ndarray, b_b: int, p_b: np.ndarray, label: str) -> int:
-    """Reconstruct the missing rigid rod between two anchor points.
-
-    Ball joints at both ends attach it to the real links `b_a`/`b_b`.
-    """
-    rod_vec = p_b - p_a
-    rod_len = float(np.linalg.norm(rod_vec))
-    rod_center = 0.5 * (p_a + p_b)
-    rod_q = _quat_between(np.array([0.0, 0.0, 1.0], dtype=np.float32), rod_vec)
-    mass = max(_MIN_BODY_MASS, _ROD_LINEAR_DENSITY * rod_len)
-
+def _add_rod_body(builder: newton.ModelBuilder, center: np.ndarray, rod_q: wp.quat, half_len: float, label: str) -> int:
+    mass = max(_MIN_BODY_MASS, _ROD_LINEAR_DENSITY * 2.0 * half_len)
     rod = builder.add_link(
-        xform=wp.transform(wp.vec3(*rod_center.astype(np.float32)), rod_q),
+        xform=wp.transform(wp.vec3(*center.astype(np.float32)), rod_q),
         com=wp.vec3(0.0, 0.0, 0.0),
-        inertia=_box_inertia(mass, _ROD_RADIUS, _ROD_RADIUS, 0.5 * rod_len),
+        inertia=_box_inertia(mass, _ROD_RADIUS, _ROD_RADIUS, half_len),
         mass=mass,
         label=label,
         lock_inertia=True,
@@ -180,19 +176,88 @@ def _add_pushrod(builder: newton.ModelBuilder, b_a: int, p_a: np.ndarray, b_b: i
     cfg.has_shape_collision = False
     cfg.has_particle_collision = False
     builder.add_shape_capsule(
-        rod, radius=_ROD_RADIUS, half_height=0.5 * rod_len, cfg=cfg, color=_ROD_COLOR, label=f"{label}_bar"
+        rod, radius=_ROD_RADIUS, half_height=half_len, cfg=cfg, color=_ROD_COLOR, label=f"{label}_bar"
     )
-
-    rod_xform = builder.body_q[rod]
-    for b_link, p_anchor, end in ((b_a, p_a, "a"), (b_b, p_b, "b")):
-        builder.add_joint_ball(
-            parent=b_link,
-            child=rod,
-            parent_xform=wp.transform(_local_point(builder.body_q[b_link], p_anchor), wp.quat_identity()),
-            child_xform=wp.transform(_local_point(rod_xform, p_anchor), wp.quat_identity()),
-            label=f"{label}_ball_{end}",
-        )
     return rod
+
+
+def _end_frames(
+    builder: newton.ModelBuilder, b_link: int, rod: int, p_anchor: np.ndarray, world_rot: wp.quat
+) -> tuple[wp.transform, wp.transform]:
+    """Parent/child joint frames at `p_anchor` whose world rotation is `world_rot`."""
+    t_link = wp.transform(*builder.body_q[b_link])
+    t_rod = wp.transform(*builder.body_q[rod])
+    q_link = wp.transform_get_rotation(t_link)
+    q_rod = wp.transform_get_rotation(t_rod)
+    px = wp.transform(_local_point(t_link, p_anchor), wp.quat_inverse(q_link) * world_rot)
+    cx = wp.transform(_local_point(t_rod, p_anchor), wp.quat_inverse(q_rod) * world_rot)
+    return px, cx
+
+
+def _add_pushrod(
+    builder: newton.ModelBuilder,
+    b_a: int,
+    p_a: np.ndarray,
+    b_b: int,
+    p_b: np.ndarray,
+    label: str,
+    rod_type: str = "ss",
+) -> str:
+    """Reconstruct the missing rod between two anchor points; returns the b-end joint label.
+
+    rod_type selects the end-joint implementation (see h2_closed_loops.md):
+      ss  — ball-ball: pure distance constraint; leaves a free spin DOF about the rod axis.
+      su  — ball + universal (D6 with 2 angular axes ⊥ rod): same net constraint, no spin DOF.
+      rr  — revolute pins about the link-local Y axis: exact for planar sagittal loops
+            (H2 knee four-bar); overconstrained for spatial loops — do not use on the ankle.
+    """
+    rod_vec = p_b - p_a
+    rod_len = float(np.linalg.norm(rod_vec))
+    rod_q = _quat_between(np.array([0.0, 0.0, 1.0], dtype=np.float32), rod_vec)
+
+    rod = _add_rod_body(builder, 0.5 * (p_a + p_b), rod_q, 0.5 * rod_len, label)
+
+    if rod_type == "ss":
+        for b_link, p_anchor, end in ((b_a, p_a, "a"), (b_b, p_b, "b")):
+            px, cx = _end_frames(builder, b_link, rod, p_anchor, wp.quat_identity())
+            builder.add_joint_ball(
+                parent=b_link, child=rod, parent_xform=px, child_xform=cx, label=f"{label}_ball_{end}"
+            )
+        return f"{label}_ball_b"
+
+    if rod_type == "rr":
+        # Pin both ends about the link-local Y axis (sagittal plane normal).
+        for b_link, p_anchor, end in ((b_a, p_a, "a"), (b_b, p_b, "b")):
+            q_link = wp.transform_get_rotation(wp.transform(*builder.body_q[b_link]))
+            px, cx = _end_frames(builder, b_link, rod, p_anchor, q_link)
+            builder.add_joint_revolute(
+                parent=b_link,
+                child=rod,
+                parent_xform=px,
+                child_xform=cx,
+                axis=(0.0, 1.0, 0.0),
+                label=f"{label}_pin_{end}",
+            )
+        return f"{label}_pin_b"
+
+    if rod_type == "su":
+        px, cx = _end_frames(builder, b_a, rod, p_a, wp.quat_identity())
+        builder.add_joint_ball(parent=b_a, child=rod, parent_xform=px, child_xform=cx, label=f"{label}_ball_a")
+        # Universal end: joint frame z along the rod; two angular DOFs ⊥ rod,
+        # twist about the rod axis is locked.
+        px, cx = _end_frames(builder, b_b, rod, p_b, rod_q)
+        dof = newton.ModelBuilder.JointDofConfig
+        builder.add_joint_d6(
+            parent=b_b,
+            child=rod,
+            parent_xform=px,
+            child_xform=cx,
+            angular_axes=[dof(axis=(1.0, 0.0, 0.0)), dof(axis=(0.0, 1.0, 0.0))],
+            label=f"{label}_uni_b",
+        )
+        return f"{label}_uni_b"
+
+    raise ValueError(f"Unknown rod_type {rod_type!r}")
 
 
 class Example:
@@ -203,6 +268,25 @@ class Example:
         self.sim_substeps = max(1, round(self.frame_dt / self.sim_dt))
         self.sim_time = 0.0
         self.viewer = viewer
+
+        drive_group = getattr(args, "drive", "all")
+        knee_amp = math.radians(getattr(args, "knee_amplitude_deg", 25.0))
+        self.driven_joints = {}
+        if drive_group != "waist":
+            for name, amp in _DRIVEN_JOINTS.items():
+                if drive_group == "knee" and "knee_motor" not in name:
+                    continue
+                if drive_group == "ankle" and "ankle_A" not in name:
+                    continue
+                self.driven_joints[name] = knee_amp if "knee_motor" in name else amp
+        self.drive_waist = drive_group in ("all", "waist")
+        self.waist_antiphase = getattr(args, "waist_antiphase", False)
+        self.rocker_amplitude_deg = getattr(args, "rocker_amplitude_deg", 6.0)
+        # Direct-drive the waist pitch joint (the URDF marks it effort=180,
+        # i.e. an actuated serial interface); the rod linkage then complies.
+        self.waist_direct = getattr(args, "waist_direct", False)
+        if self.waist_direct:
+            self.driven_joints["waist_pitch_joint"] = math.radians(10.0)
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=getattr(args, "gravity", -9.81))
         builder.add_urdf(
@@ -215,15 +299,21 @@ class Example:
         _rest_pose_fk(builder)
         self._bump_placeholder_masses(builder)
 
+        rod_types = {
+            "ankle": getattr(args, "ankle_rod", "ss"),
+            "knee": getattr(args, "knee_rod", "ss"),
+            "waist": "ss",  # rigid passive rods; actuation goes through the rockers
+        }
         body_labels = builder.body_label
         self.loop_ball_labels = []
         for link_a, marker_a, link_b, marker_b, rod_label in _LOOPS:
+            group = "ankle" if "ankle" in rod_label else ("knee" if "knee" in rod_label else "waist")
             b_a = _find(body_labels, link_a)
             b_b = _find(body_labels, link_b)
             p_a = np.array(builder.body_q[_find(body_labels, marker_a)])[:3]
             p_b = np.array(builder.body_q[_find(body_labels, marker_b)])[:3]
-            _add_pushrod(builder, b_a, p_a, b_b, p_b, rod_label)
-            self.loop_ball_labels.append(f"{rod_label}_ball_b")
+            end_label = _add_pushrod(builder, b_a, p_a, b_b, p_b, rod_label, rod_type=rod_types[group])
+            self.loop_ball_labels.append(end_label)
 
         _single_closed_loop_articulation(builder, "h2_loops")
         builder.color()
@@ -263,8 +353,11 @@ class Example:
 
     @staticmethod
     def _bump_placeholder_masses(builder: newton.ModelBuilder) -> None:
+        # Includes zero-mass sensor bodies (camera/IMU): the VBD solver treats
+        # inv_mass == 0 as a static anchor, and their fixed joints would weld
+        # the torso/head chain to the world, freezing the whole spine.
         for b in range(len(builder.body_mass)):
-            if builder.body_mass[b] <= 0.0 or builder.body_mass[b] >= _MIN_BODY_MASS:
+            if builder.body_mass[b] >= _MIN_BODY_MASS:
                 continue
             builder.body_mass[b] = _MIN_BODY_MASS
             builder.body_inv_mass[b] = 1.0 / _MIN_BODY_MASS
@@ -283,7 +376,7 @@ class Example:
         target_kd = self.model.joint_target_kd.numpy()
 
         self.drive_dofs = {}
-        for name, joint_index in ((n, joint_labels.index(n)) for n in joint_labels if n in _DRIVEN_JOINTS):
+        for name, joint_index in ((n, joint_labels.index(n)) for n in joint_labels if n in self.driven_joints):
             dof = int(qd_start[joint_index])
             self.drive_dofs[name] = dof
             mode[dof] = int(newton.JointTargetMode.POSITION_VELOCITY)
@@ -291,16 +384,28 @@ class Example:
             target_kd[dof] = 25.0
 
         for joint_index, name in enumerate(joint_labels):
-            if joint_type[joint_index] != int(newton.JointType.REVOLUTE) or name in _DRIVEN_JOINTS:
+            if joint_type[joint_index] != int(newton.JointType.REVOLUTE) or name in self.drive_dofs:
                 continue
             dof = int(qd_start[joint_index])
-            if name in _PASSIVE_JOINTS:
+            if name in _PASSIVE_JOINTS and not (self.waist_direct and name == "waist_pitch_joint"):
                 mode[dof] = int(newton.JointTargetMode.NONE)
             else:
                 # Hold arms/head/hips/waist-yaw/ankle-roll at the rest pose.
                 mode[dof] = int(newton.JointTargetMode.POSITION_VELOCITY)
                 target_ke[dof] = 200.0
                 target_kd[dof] = 20.0
+
+        # Waist actuation: drive the rockers (torso_constraint_L/R) as motor
+        # crank arms through the rigid rods (unless --waist-direct is used).
+        if self.drive_waist and not self.waist_direct:
+            rocker_amp = math.radians(self.rocker_amplitude_deg)
+            for name in ("torso_constraint_L_joint", "torso_constraint_R_joint"):
+                dof = int(qd_start[joint_labels.index(name)])
+                self.drive_dofs[name] = dof
+                self.driven_joints[name] = rocker_amp
+                mode[dof] = int(newton.JointTargetMode.POSITION_VELOCITY)
+                target_ke[dof] = 500.0
+                target_kd[dof] = 25.0
 
         self.model.joint_target_mode.assign(mode)
         self.model.joint_target_ke.assign(target_ke)
@@ -311,12 +416,15 @@ class Example:
             t = self.sim_time + substep * self.sim_dt
             phase = 2.0 * math.pi * _DRIVE_FREQUENCY * t
             for name, dof in self.drive_dofs.items():
-                amp = _DRIVEN_JOINTS[name]
+                amp = self.driven_joints[name]
                 if "knee_motor" in name:
                     # Raised cosine keeps knee flexion inside its [-0.2, 2.9] range.
                     self.target_q[dof] = amp * 0.5 * (1.0 - math.cos(phase))
                 else:
-                    self.target_q[dof] = amp * math.sin(phase)
+                    # Ankle A-cranks or waist rocker cranks (anti-phase rockers -> pitch).
+                    right_side = name.startswith("torso_constraint_R")
+                    sign = -1.0 if self.waist_antiphase and right_side else 1.0
+                    self.target_q[dof] = sign * amp * math.sin(phase)
             self.control.joint_target_q.assign(self.target_q)
 
             self.state_0.clear_forces()
@@ -381,20 +489,25 @@ class Example:
         init_finite = bool(np.all(np.isfinite(self.state_0.body_q.numpy())))
         gaps = self._loop_gaps()
         print(f"initial body_q finite={init_finite}  initial max_gap_mm={max(gaps) * 1e3:.4f}")
-        header = f"{'frame':>5} {'knee_tgt':>9} {'l_knee':>7} {'r_knee':>7} {'l_pitch':>8} {'r_pitch':>8} {'max_gap_mm':>11} {'finite':>7}"
+        header = (
+            f"{'frame':>5} {'knee_tgt':>9} {'l_knee':>7} {'r_knee':>7} {'l_pitch':>8} {'r_pitch':>8}"
+            f" {'w_pitch':>8} {'max_gap_mm':>11} {'finite':>7}"
+        )
         print(header)
         for frame in range(frames):
             self.step()
-            knee_tgt = math.degrees(float(self.target_q[self.drive_dofs["left_knee_motor_joint"]]))
+            knee_dof = self.drive_dofs.get("left_knee_motor_joint")
+            knee_tgt = math.degrees(float(self.target_q[knee_dof])) if knee_dof is not None else 0.0
             l_knee = self._joint_angle_deg("left_knee_joint")
             r_knee = self._joint_angle_deg("right_knee_joint")
             l_pitch = self._joint_angle_deg("left_ankle_pitch_joint")
             r_pitch = self._joint_angle_deg("right_ankle_pitch_joint")
+            w_pitch = self._joint_angle_deg("waist_pitch_joint")
             gaps = self._loop_gaps()
             finite = bool(np.all(np.isfinite(self.state_0.body_q.numpy())))
             print(
                 f"{frame:>5} {knee_tgt:>9.2f} {l_knee:>7.2f} {r_knee:>7.2f} {l_pitch:>8.2f} {r_pitch:>8.2f}"
-                f" {max(gaps) * 1e3:>11.3f} {finite!s:>7}"
+                f" {w_pitch:>8.2f} {max(gaps) * 1e3:>11.3f} {finite!s:>7}"
             )
             if not finite:
                 break
@@ -408,6 +521,21 @@ class Example:
         parser.add_argument("--solve", choices=["local", "block_sparse_joints"], default="block_sparse_joints")
         parser.add_argument("--gravity", type=float, default=-9.81)
         parser.add_argument("--iterations", type=int, default=8)
+        parser.add_argument(
+            "--drive", choices=["all", "knee", "ankle", "waist"], default="all", help="Which cranks to drive."
+        )
+        parser.add_argument("--knee-amplitude-deg", type=float, default=25.0)
+        parser.add_argument("--ankle-rod", choices=["ss", "su"], default="ss", help="Ankle rod ends (spatial loop).")
+        parser.add_argument("--knee-rod", choices=["ss", "rr", "su"], default="ss", help="Knee rod ends (planar loop).")
+        parser.add_argument(
+            "--waist-antiphase", action="store_true", help="Anti-phase rocker drive (pitch) instead of in-phase (roll)."
+        )
+        parser.add_argument(
+            "--waist-direct", action="store_true", help="Direct-drive waist_pitch_joint; the rod linkage complies."
+        )
+        parser.add_argument(
+            "--rocker-amplitude-deg", type=float, default=6.0, help="Waist rocker-crank drive amplitude."
+        )
         parser.set_defaults(num_frames=240)
         return parser
 
