@@ -33,6 +33,7 @@
 #
 # Command: python -m newton.examples lego_bricks
 #          python -m newton.examples lego_bricks --solver xpbd
+#          python -m newton.examples lego_bricks --world-count 64
 #
 ###########################################################################
 
@@ -231,57 +232,72 @@ def _build_mesh_with_sdf(verts, faces, color):
 
 
 @wp.kernel
-def _add_forces(src: wp.array(dtype=wp.spatial_vector), dst: wp.array(dtype=wp.spatial_vector)):
+def _add_forces(src: wp.array[wp.spatial_vector], dst: wp.array[wp.spatial_vector]):
     i = wp.tid()
     dst[i] = dst[i] + src[i]
 
 
 @wp.kernel
 def _set_kinematic_bodies(
-    body_q: wp.array(dtype=wp.transform),
-    joint_q: wp.array(dtype=wp.float32),
-    joint_qd: wp.array(dtype=wp.float32),
-    finger_l: int,
-    finger_r: int,
-    pusher: int,
-    jq_start_l: int,
-    jq_start_r: int,
-    jq_start_p: int,
-    jqd_start_l: int,
-    jqd_start_r: int,
-    jqd_start_p: int,
-    params: wp.array(dtype=wp.float32),
+    body_q: wp.array[wp.transform],
+    joint_q: wp.array[wp.float32],
+    joint_qd: wp.array[wp.float32],
+    kin_idx: wp.array2d[wp.int32],
+    world_origin: wp.array[wp.vec3],
+    params: wp.array[wp.float32],
 ):
+    # One thread per world. Column layout of kin_idx:
+    #   0..2 body indices   (finger_l, finger_r, pusher)
+    #   3..5 joint_q_start  (finger_l, finger_r, pusher)
+    #   6..8 joint_qd_start (finger_l, finger_r, pusher)
+    w = wp.tid()
+    finger_l = kin_idx[w, 0]
+    finger_r = kin_idx[w, 1]
+    pusher = kin_idx[w, 2]
+    jq_start_l = kin_idx[w, 3]
+    jq_start_r = kin_idx[w, 4]
+    jq_start_p = kin_idx[w, 5]
+    jqd_start_l = kin_idx[w, 6]
+    jqd_start_r = kin_idx[w, 7]
+    jqd_start_p = kin_idx[w, 8]
+
     # params: [gripper_y, gripper_z, pusher_z]
     y = params[0]
     z = params[1]
     pz = params[2]
 
-    body_q[finger_l] = wp.transform(wp.vec3(0.0, -y, z), wp.quat_identity())
-    body_q[finger_r] = wp.transform(wp.vec3(0.0, y, z), wp.quat_identity())
-    body_q[pusher] = wp.transform(wp.vec3(0.0, 0.0, pz), wp.quat_identity())
+    # Targets are expressed in the world's local frame, so shift them by the
+    # world's origin (non-zero only when replicate() is given a spacing).
+    o = world_origin[w]
+    p_l = wp.vec3(o[0], o[1] - y, o[2] + z)
+    p_r = wp.vec3(o[0], o[1] + y, o[2] + z)
+    p_p = wp.vec3(o[0], o[1], o[2] + pz)
+
+    body_q[finger_l] = wp.transform(p_l, wp.quat_identity())
+    body_q[finger_r] = wp.transform(p_r, wp.quat_identity())
+    body_q[pusher] = wp.transform(p_p, wp.quat_identity())
 
     # Also update joint_q so MuJoCo's solver sees the correct positions
     # Free joint_q layout: [px, py, pz, qx, qy, qz, qw]
-    joint_q[jq_start_l + 0] = 0.0
-    joint_q[jq_start_l + 1] = -y
-    joint_q[jq_start_l + 2] = z
+    joint_q[jq_start_l + 0] = p_l[0]
+    joint_q[jq_start_l + 1] = p_l[1]
+    joint_q[jq_start_l + 2] = p_l[2]
     joint_q[jq_start_l + 3] = 0.0
     joint_q[jq_start_l + 4] = 0.0
     joint_q[jq_start_l + 5] = 0.0
     joint_q[jq_start_l + 6] = 1.0
 
-    joint_q[jq_start_r + 0] = 0.0
-    joint_q[jq_start_r + 1] = y
-    joint_q[jq_start_r + 2] = z
+    joint_q[jq_start_r + 0] = p_r[0]
+    joint_q[jq_start_r + 1] = p_r[1]
+    joint_q[jq_start_r + 2] = p_r[2]
     joint_q[jq_start_r + 3] = 0.0
     joint_q[jq_start_r + 4] = 0.0
     joint_q[jq_start_r + 5] = 0.0
     joint_q[jq_start_r + 6] = 1.0
 
-    joint_q[jq_start_p + 0] = 0.0
-    joint_q[jq_start_p + 1] = 0.0
-    joint_q[jq_start_p + 2] = pz
+    joint_q[jq_start_p + 0] = p_p[0]
+    joint_q[jq_start_p + 1] = p_p[1]
+    joint_q[jq_start_p + 2] = p_p[2]
     joint_q[jq_start_p + 3] = 0.0
     joint_q[jq_start_p + 4] = 0.0
     joint_q[jq_start_p + 5] = 0.0
@@ -311,6 +327,7 @@ class Example:
 
         solver_type = getattr(args, "solver", None) or "xpbd"
         self.solver_type = solver_type
+        self.world_count = max(1, int(getattr(args, "world_count", 1) or 1))
 
         # -- phase timing (seconds) ----------------------------------------
         self.t_push_start = 0.05
@@ -332,8 +349,11 @@ class Example:
         mesh_2x2 = _build_mesh_with_sdf(v_2x2, f_2x2, color=(0.2, 0.4, 0.8))
 
         # -- scene ----------------------------------------------------------
+        # `world` holds one brick assembly; it is replicated `world_count`
+        # times into `builder`, which owns the shared ground plane.
         print("Building scene …")
         builder = newton.ModelBuilder()
+        world = newton.ModelBuilder()
 
         if solver_type == "mujoco":
             contact_ke, contact_kd = 1e4, 2e2
@@ -362,19 +382,19 @@ class Example:
         builder.add_ground_plane(cfg=ground_cfg)
 
         # 2x4 brick
-        self.body_2x4 = builder.add_body(
+        self.body_2x4 = world.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.001 * SCENE_SCALE), wp.quat_identity()),
             label="brick_2x4",
         )
-        builder.add_shape_mesh(self.body_2x4, mesh=mesh_2x4, cfg=brick_cfg)
+        world.add_shape_mesh(self.body_2x4, mesh=mesh_2x4, cfg=brick_cfg)
 
         # 2x2 brick -- start well above the 2x4 studs so there's no initial overlap
         drop_gap = 0.01 * SCENE_SCALE
-        self.body_2x2 = builder.add_body(
+        self.body_2x2 = world.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, BODY_HEIGHT + drop_gap), wp.quat_identity()),
             label="brick_2x2",
         )
-        builder.add_shape_mesh(self.body_2x2, mesh=mesh_2x2, cfg=brick_cfg)
+        world.add_shape_mesh(self.body_2x2, mesh=mesh_2x2, cfg=brick_cfg)
 
         # pusher cube (kinematic, slides vertically above the bricks)
         pusher_hx = PITCH * 1.5
@@ -389,11 +409,11 @@ class Example:
             mu=0.3,
             gap=contact_gap,
         )
-        self.body_pusher = builder.add_body(
+        self.body_pusher = world.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, self.pusher_rest_z), wp.quat_identity()),
             label="pusher",
         )
-        builder.add_shape_box(self.body_pusher, hx=pusher_hx, hy=pusher_hy, hz=pusher_hz, cfg=pusher_cfg)
+        world.add_shape_box(self.body_pusher, hx=pusher_hx, hy=pusher_hy, hz=pusher_hz, cfg=pusher_cfg)
 
         # gripper fingers (approach along ±Y, grip the full 2-brick stack)
         brick_hy = PITCH  # brick outer half-width in Y
@@ -405,36 +425,49 @@ class Example:
         self.gripper_open_y = 0.050 * SCENE_SCALE
         self.gripper_closed_y = brick_hy + finger_hy - 0.0005 * SCENE_SCALE
 
-        self.body_finger_l = builder.add_body(
+        self.body_finger_l = world.add_body(
             xform=wp.transform(wp.vec3(0.0, -self.gripper_open_y, self.finger_cz), wp.quat_identity()),
             label="finger_left",
         )
-        builder.add_shape_box(self.body_finger_l, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=gripper_cfg)
+        world.add_shape_box(self.body_finger_l, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=gripper_cfg)
 
-        self.body_finger_r = builder.add_body(
+        self.body_finger_r = world.add_body(
             xform=wp.transform(wp.vec3(0.0, self.gripper_open_y, self.finger_cz), wp.quat_identity()),
             label="finger_right",
         )
-        builder.add_shape_box(self.body_finger_r, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=gripper_cfg)
+        world.add_shape_box(self.body_finger_r, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=gripper_cfg)
 
         # -- finalize -------------------------------------------------------
+        # Worlds stay stacked at the origin for numerical stability; the viewer
+        # spreads them apart visually via set_world_offsets() below.
+        self.bodies_per_world = world.body_count
+        builder.replicate(world, self.world_count)
+
         if solver_type == "vbd":
             builder.color()
 
         self.model = builder.finalize()
-        self.model.rigid_contact_max = 256
+        contact_max = 256 * self.world_count
+        self.model.rigid_contact_max = contact_max
+
+        # nxn partitions pairs per world (its thread count is the sum of each
+        # world's lower-triangular pair count), so it stays linear in
+        # world_count and beats SAP here at every scale measured up to 1024.
+        broad_phase = getattr(args, "broad_phase", None) or "nxn"
+        self.broad_phase = broad_phase
 
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             reduce_contacts=True,
-            rigid_contact_max=256,
-            broad_phase="nxn",
+            rigid_contact_max=contact_max,
+            broad_phase=broad_phase,
         )
 
         if solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(
                 self.model,
                 use_mujoco_contacts=False,
+                # Per-world budgets -- do not scale by world_count.
                 nconmax=512,
                 njmax=512,
                 solver="newton",
@@ -466,27 +499,45 @@ class Example:
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        # Look up joint_q_start / joint_qd_start for kinematic bodies
+        # Per-world body index of each template body (replicate() lays worlds
+        # out contiguously, so world w owns [w * bodies_per_world, ...)).
+        stride = self.bodies_per_world
+        self.bodies_2x4 = [self.body_2x4 + w * stride for w in range(self.world_count)]
+        self.bodies_2x2 = [self.body_2x2 + w * stride for w in range(self.world_count)]
+
+        # Look up joint_q_start / joint_qd_start for every world's kinematic
+        # bodies, packed into the table consumed by _set_kinematic_bodies.
         joint_child_np = self.model.joint_child.numpy()
         jq_start_np = self.model.joint_q_start.numpy()
         jqd_start_np = self.model.joint_qd_start.numpy()
-        self.jq_start_l = self.jq_start_r = self.jq_start_p = 0
-        self.jqd_start_l = self.jqd_start_r = self.jqd_start_p = 0
+        jq_of_body = {}
         for j in range(self.model.joint_count):
-            if joint_child_np[j] == self.body_finger_l:
-                self.jq_start_l = int(jq_start_np[j])
-                self.jqd_start_l = int(jqd_start_np[j])
-            elif joint_child_np[j] == self.body_finger_r:
-                self.jq_start_r = int(jq_start_np[j])
-                self.jqd_start_r = int(jqd_start_np[j])
-            elif joint_child_np[j] == self.body_pusher:
-                self.jq_start_p = int(jq_start_np[j])
-                self.jqd_start_p = int(jqd_start_np[j])
+            jq_of_body[int(joint_child_np[j])] = (int(jq_start_np[j]), int(jqd_start_np[j]))
+
+        kin_idx = np.zeros((self.world_count, 9), dtype=np.int32)
+        for w in range(self.world_count):
+            bl = self.body_finger_l + w * stride
+            br = self.body_finger_r + w * stride
+            bp = self.body_pusher + w * stride
+            kin_idx[w, 0:3] = (bl, br, bp)
+            for col, b in enumerate((bl, br, bp)):
+                jq, jqd = jq_of_body.get(b, (0, 0))
+                kin_idx[w, 3 + col] = jq
+                kin_idx[w, 6 + col] = jqd
+        self._kin_idx = wp.array(kin_idx, dtype=wp.int32)
+
+        # Each world's origin, recovered from the rest pose of its left finger
+        # (zero unless replicate() was given a non-zero spacing).
+        rest_q = self.state_0.body_q.numpy()
+        finger_rest = np.array([0.0, -self.gripper_open_y, self.finger_cz], dtype=np.float32)
+        origins = np.stack([rest_q[int(kin_idx[w, 0])][:3] - finger_rest for w in range(self.world_count)])
+        self._world_origin = wp.array(origins, dtype=wp.vec3)
 
         # GPU-side arrays updated each frame before graph launch
         n_bodies = self.model.body_count
         push_f = np.zeros((n_bodies, 6), dtype=np.float32)
-        push_f[self.body_2x2][2] = self.push_force
+        for b in self.bodies_2x2:
+            push_f[b][2] = self.push_force
         self._push_force_base = wp.array(push_f, dtype=wp.spatial_vector)
         self._push_force = wp.zeros(n_bodies, dtype=wp.spatial_vector)
 
@@ -515,6 +566,9 @@ class Example:
             ps[6] = 5.0
             ps[7] = 1.0
             self.viewer.picking.pick_state = wp.array(ps, dtype=float, device=self.model.device)
+        if self.world_count > 1:
+            spread = 0.08 * SCENE_SCALE
+            self.viewer.set_world_offsets((spread, spread, 0.0))
         cam_dist = 0.12 * SCENE_SCALE
         self.viewer.set_camera(pos=wp.vec3(cam_dist, -cam_dist, cam_dist * 0.6), pitch=-25.0, yaw=135.0)
 
@@ -534,20 +588,13 @@ class Example:
         for _ in range(self.sim_substeps):
             wp.launch(
                 _set_kinematic_bodies,
-                dim=1,
+                dim=self.world_count,
                 inputs=[
                     self.state_0.body_q,
                     self.state_0.joint_q,
                     self.state_0.joint_qd,
-                    self.body_finger_l,
-                    self.body_finger_r,
-                    self.body_pusher,
-                    self.jq_start_l,
-                    self.jq_start_r,
-                    self.jq_start_p,
-                    self.jqd_start_l,
-                    self.jqd_start_r,
-                    self.jqd_start_p,
+                    self._kin_idx,
+                    self._world_origin,
                     self._kin_params,
                 ],
             )
@@ -646,11 +693,12 @@ class Example:
 
     def test_final(self):
         body_q = self.state_0.body_q.numpy()
-        z_2x4 = body_q[self.body_2x4][2]
-        z_2x2 = body_q[self.body_2x2][2]
+        for w, (b_2x4, b_2x2) in enumerate(zip(self.bodies_2x4, self.bodies_2x2, strict=True)):
+            z_2x4 = body_q[b_2x4][2]
+            z_2x2 = body_q[b_2x2][2]
 
-        assert z_2x4 > -0.01 * SCENE_SCALE, f"2x4 brick fell through ground: z={z_2x4:.4f}"
-        assert z_2x2 > z_2x4, f"2x2 should be above 2x4: z_2x2={z_2x2:.4f}, z_2x4={z_2x4:.4f}"
+            assert z_2x4 > -0.01 * SCENE_SCALE, f"world {w}: 2x4 brick fell through ground: z={z_2x4:.4f}"
+            assert z_2x2 > z_2x4, f"world {w}: 2x2 should be above 2x4: z_2x2={z_2x2:.4f}, z_2x4={z_2x4:.4f}"
 
 
 if __name__ == "__main__":
@@ -661,6 +709,14 @@ if __name__ == "__main__":
         default="xpbd",
         choices=["xpbd", "mujoco", "vbd"],
         help="Solver type.",
+    )
+    newton.examples.add_world_count_arg(parser)
+    parser.add_argument(
+        "--broad-phase",
+        type=str,
+        default=None,
+        choices=["nxn", "sap"],
+        help="Broad phase. Defaults to nxn.",
     )
 
     viewer, args = newton.examples.init(parser)
