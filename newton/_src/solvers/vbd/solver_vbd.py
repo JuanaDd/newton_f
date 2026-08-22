@@ -1956,6 +1956,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 need to be allocated or grown during graph capture.
         """
         self._apply_module_options()
+        self._last_step_dt = dt
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -3596,6 +3597,44 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Populate ``contacts.force`` from VBD rigid contact forces of the last :meth:`step`.
+
+        The linear component is the contact force applied to the body of
+        ``rigid_contact_shape0`` [N]; the angular component is zero (VBD does
+        not model torsional or rolling friction torques).
+
+        Args:
+            contacts: :class:`Contacts` object whose :attr:`~Contacts.force` buffer will be
+                written. Must have been created with ``"force"`` in its requested attributes
+                and passed to the preceding :meth:`step`.
+            state: State holding the post-step body transforms (``body_q``). If None, the
+                model's rest transforms are used.
+
+        Raises:
+            ValueError: If ``contacts.force`` is None (not requested) or no step has been run yet.
+        """
+        if contacts.force is None:
+            raise ValueError(
+                "contacts.force is not allocated. Call model.request_contact_attributes('force') "
+                "before creating the Contacts object."
+            )
+        dt = getattr(self, "_last_step_dt", None)
+        if dt is None:
+            raise ValueError("No contact force data available. Call step() before update_contacts().")
+        body_q = state.body_q if state is not None else self.model.body_q
+        _, _, _, _, force_on_body1, count = self.collect_rigid_contact_forces(
+            body_q, self._coupling_body_q_prev_snapshot, contacts, dt
+        )
+        wp.launch(
+            kernel=_pack_rigid_contact_force_spatial,
+            dim=contacts.rigid_contact_max,
+            inputs=[count, force_on_body1],
+            outputs=[contacts.force],
+            device=self.device,
+        )
+
     def collect_rigid_contact_forces(
         self,
         body_q: wp.array[wp.transform],
@@ -3837,3 +3876,23 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         if self.particle_enable_self_contact:
             self.trimesh_collision_detector.rebuild(state.particle_q)
+
+
+@wp.kernel
+def _pack_rigid_contact_force_spatial(
+    rigid_contact_count: wp.array[wp.int32],
+    force_on_body1: wp.array[wp.vec3],
+    # output
+    contact_force: wp.array[wp.spatial_vector],
+):
+    """Pack per-contact forces into ``contacts.force`` spatial vectors.
+
+    The linear (top) component is the force on the body of ``rigid_contact_shape0``
+    (the negation of the collected force on body1); the angular (bottom) component
+    is zero.
+    """
+    tid = wp.tid()
+    if tid >= rigid_contact_count[0] or tid >= force_on_body1.shape[0]:
+        contact_force[tid] = wp.spatial_vector()
+        return
+    contact_force[tid] = wp.spatial_vector(-force_on_body1[tid], wp.vec3(0.0))
