@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import math
+import os
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import warp as wp
@@ -37,6 +39,7 @@ import newton
 import newton.examples
 
 DEFAULT_URDF = "/home/yvetted/Downloads/unitree_ros_h2/robots/h2_description/H2_loop.urdf"
+DEFAULT_MJCF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "h2_description", "H2loop_complete.xml")
 
 _DRIVE_FREQUENCY = 0.25  # Hz
 
@@ -90,6 +93,83 @@ _DRIVEN_JOINTS = {
     "left_knee_motor_joint": math.radians(25.0),
     "right_knee_motor_joint": math.radians(25.0),
 }
+
+
+_MJCF_ATTRIBUTES = ("armature", "damping", "frictionloss")
+
+
+def _load_mjcf_joint_params(path: str) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """Read per-joint physical parameters from a MuJoCo XML.
+
+    Returns a name -> params map for named joints (armature [kg·m²],
+    damping [N·m·s/rad], frictionloss [N·m], effort_limit [N·m] from
+    ``actuatorfrcrange``), plus the defaults from ``<default><joint>``.
+    """
+    root = ET.parse(path).getroot()
+    defaults = {}
+    default_joint = root.find("./default/joint")
+    if default_joint is not None:
+        for attr in _MJCF_ATTRIBUTES:
+            if attr in default_joint.attrib:
+                defaults[attr] = float(default_joint.get(attr))
+    per_joint = {}
+    for joint in root.iter("joint"):
+        name = joint.get("name")
+        if name is None:
+            continue
+        params = {attr: float(joint.get(attr)) for attr in _MJCF_ATTRIBUTES if attr in joint.attrib}
+        if "actuatorfrcrange" in joint.attrib:
+            lo, hi = (float(v) for v in joint.get("actuatorfrcrange").split())
+            params["effort_limit"] = max(abs(lo), abs(hi))
+        if params:
+            per_joint[name] = params
+    return per_joint, defaults
+
+
+# The MJCF names the ankle motor cranks differently from the URDF.
+_MJCF_JOINT_ALIASES = {
+    "left_ankle_A_joint": "left_ankle_motor_joint",
+    "right_ankle_A_joint": "right_ankle_motor_joint",
+}
+
+
+def _apply_mjcf_joint_params(builder: newton.ModelBuilder, path: str) -> None:
+    """Override the URDF joints' physical parameters with the MJCF-defined values.
+
+    Notes on solver support (SolverVBD): armature needs
+    ``rigid_joint_armature=True`` (revolute only); passive ``damping`` is
+    applied through ``joint_target_kd`` since VBD reads kd as absolute damping
+    and ignores target modes; ``joint_friction`` (frictionloss) and
+    ``joint_effort_limit`` are stored on the model but not used by VBD.
+    """
+    per_joint, defaults = _load_mjcf_joint_params(path)
+    matched = 0
+    for j, label in enumerate(builder.joint_label):
+        name = label.rsplit("/", 1)[-1]
+        params = per_joint.get(_MJCF_JOINT_ALIASES.get(name, name))
+        if params is None:
+            if builder.joint_type[j] != int(newton.JointType.REVOLUTE):
+                continue
+            params = defaults
+        else:
+            matched += 1
+            params = {**defaults, **params}
+        qd_start = builder.joint_qd_start[j]
+        lin, ang = builder.joint_dof_dim[j]
+        for dof in range(qd_start, qd_start + lin + ang):
+            if "armature" in params:
+                builder.joint_armature[dof] = params["armature"]
+            if "damping" in params:
+                builder.joint_damping[dof] = params["damping"]
+                # VBD applies joint_target_kd as absolute damping regardless of
+                # target mode; _configure_drives later raises kd on driven/held
+                # joints, so this survives only on passive linkage joints.
+                builder.joint_target_kd[dof] = max(builder.joint_target_kd[dof], params["damping"])
+            if "frictionloss" in params:
+                builder.joint_friction[dof] = params["frictionloss"]
+            if "effort_limit" in params:
+                builder.joint_effort_limit[dof] = params["effort_limit"]
+    print(f"Applied MJCF joint params: {matched}/{len(per_joint)} named joints matched, defaults={defaults}")
 
 
 def _find(labels: list[str], suffix: str) -> int:
@@ -299,6 +379,10 @@ class Example:
         _rest_pose_fk(builder)
         self._bump_placeholder_masses(builder)
 
+        mjcf_path = getattr(args, "armature_mjcf", DEFAULT_MJCF)
+        if mjcf_path:
+            _apply_mjcf_joint_params(builder, mjcf_path)
+
         rod_types = {
             "ankle": getattr(args, "ankle_rod", "ss"),
             "knee": getattr(args, "knee_rod", "ss"),
@@ -328,10 +412,12 @@ class Example:
 
         # Gains follow the branch's validated VBD sparse recipe from
         # reports/vbd_complex_linkages/bench_complex_linkages.py.
+        solve_mode = getattr(args, "solve", "block_sparse_joints")
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=getattr(args, "iterations", 8),
-            rigid_articulation_solve=getattr(args, "solve", "block_sparse_joints"),
+            rigid_articulation_solve=solve_mode,
+            rigid_joint_armature=solve_mode == "block_sparse_joints",
             rigid_articulation_relaxation=0.65,
             rigid_articulation_diagonal_regularization=0.0,
             rigid_avbd_alpha=0.0,
@@ -517,6 +603,12 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--urdf", type=str, default=DEFAULT_URDF, help="Path to H2_loop.urdf.")
+        parser.add_argument(
+            "--armature_mjcf",
+            type=str,
+            default=DEFAULT_MJCF,
+            help="MuJoCo XML providing per-joint armature values; pass '' to disable.",
+        )
         parser.add_argument("--diagnose", action="store_true", help="Print linkage/loop diagnostics and exit.")
         parser.add_argument("--solve", choices=["local", "block_sparse_joints"], default="block_sparse_joints")
         parser.add_argument("--gravity", type=float, default=-9.81)
