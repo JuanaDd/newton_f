@@ -2743,3 +2743,151 @@ def solve_articulation_sparse_serial(
                 delta,
                 body_q_new,
             )
+
+
+@wp.kernel
+def solve_articulation_sparse_block32_level(
+    articulation_body_offsets: wp.array[wp.int32],
+    articulation_block_row_offsets: wp.array[wp.int32],
+    articulation_block_cols: wp.array[wp.int32],
+    articulation_block_col_offsets: wp.array[wp.int32],
+    articulation_block_col_rows: wp.array[wp.int32],
+    articulation_block_col_slots: wp.array[wp.int32],
+    articulation_schur_offsets: wp.array[wp.int32],
+    articulation_schur_dst_slots: wp.array[wp.int32],
+    articulation_schur_left_slots: wp.array[wp.int32],
+    articulation_schur_right_slots: wp.array[wp.int32],
+    articulation_diag_slots: wp.array[wp.int32],
+    articulation_level_offsets: wp.array[wp.int32],
+    articulation_level_starts: wp.array[wp.int32],
+    articulation_level_bodies: wp.array[wp.int32],
+    values_scalar: wp.array[float],
+    rhs_scalar: wp.array[float],
+    delta_scalar: wp.array[float],
+):
+    """Level-scheduled variant of :func:`solve_articulation_sparse_block32_scalar`.
+
+    Pivots grouped into elimination-tree levels are factorized concurrently:
+    each warp of the per-articulation CTA owns one pivot of the current level
+    (Cholesky + right-solve + Schur), reducing the serial elimination depth
+    from ``body_count`` to the elimination-tree height and replacing most
+    CTA-wide barriers with free intra-warp synchronization.
+
+    Same-level pivots may accumulate Schur updates into a shared ancestor
+    block, so those updates use ``wp.atomic_add``. This makes the
+    factorization non-deterministic at the floating-point-rounding level
+    across runs (bitwise reproducibility is lost; results remain within
+    normal FP tolerance).
+    """
+    thread_id = wp.tid()
+    thread_count = wp.block_dim()
+    articulation_id = thread_id // thread_count
+    lane = thread_id - articulation_id * thread_count
+    warp = lane // _SPARSE_CTA_THREADS
+    warp_lane = lane - warp * _SPARSE_CTA_THREADS
+    warp_count = thread_count // _SPARSE_CTA_THREADS
+
+    body_start = articulation_body_offsets[articulation_id]
+
+    level_base = articulation_level_offsets[articulation_id]
+    level_base_end = articulation_level_offsets[articulation_id + 1]
+    num_levels = level_base_end - level_base - 1
+
+    # ---- factorization: eliminate all pivots of a level concurrently ----
+    for level in range(num_levels):
+        lv_begin = articulation_level_starts[level_base + level]
+        lv_end = articulation_level_starts[level_base + level + 1]
+        for cursor in range(lv_begin + warp, lv_end, warp_count):
+            local_k = articulation_level_bodies[cursor]
+            row_k = body_start + local_k
+            diag_slot = articulation_diag_slots[row_k]
+
+            if warp_lane == 0:
+                _cholesky66_scalar(values_scalar, diag_slot)
+            _warp_sync()
+
+            col_begin = articulation_block_col_offsets[row_k]
+            col_end = articulation_block_col_offsets[row_k + 1]
+            for col_entry in range(col_begin, col_end):
+                slot_ik = articulation_block_col_slots[col_entry]
+                if warp_lane < _SPARSE_BLOCK_DIM:
+                    _right_solve_lower_transpose66_scalar_row(values_scalar, slot_ik, diag_slot, warp_lane)
+            _warp_sync()
+
+            schur_begin = articulation_schur_offsets[row_k]
+            schur_end = articulation_schur_offsets[row_k + 1]
+            for schur_entry in range(schur_begin, schur_end):
+                dst_slot = articulation_schur_dst_slots[schur_entry]
+                left_slot = articulation_schur_left_slots[schur_entry]
+                right_slot = articulation_schur_right_slots[schur_entry]
+                elem = warp_lane
+                for _elem_pass in range(2):
+                    if elem < _SPARSE_BLOCK_SIZE:
+                        block_row = elem // _SPARSE_BLOCK_DIM
+                        block_col = elem - block_row * _SPARSE_BLOCK_DIM
+                        accum = float(0.0)
+                        for p in range(6):
+                            accum = accum + _scalar_block_get(values_scalar, left_slot, block_row, p) * (
+                                _scalar_block_get(values_scalar, right_slot, block_col, p)
+                            )
+                        # Same-level pivots can target the same ancestor block.
+                        wp.atomic_add(values_scalar, _scalar_block_index(dst_slot, block_row, block_col), -accum)
+                    elem = elem + _SPARSE_CTA_THREADS
+            _warp_sync()
+
+        _cta_sync()
+
+    # ---- forward substitution: levels leaf-to-root, pivots per level in parallel ----
+    for level in range(num_levels):
+        lv_begin = articulation_level_starts[level_base + level]
+        lv_end = articulation_level_starts[level_base + level + 1]
+        for cursor in range(lv_begin + warp, lv_end, warp_count):
+            local_i = articulation_level_bodies[cursor]
+            row_i = body_start + local_i
+            if warp_lane < _SPARSE_BLOCK_DIM:
+                value = _scalar_vec_get(rhs_scalar, row_i, warp_lane)
+                row_begin = articulation_block_row_offsets[row_i]
+                row_end = articulation_block_row_offsets[row_i + 1]
+                for row_entry in range(row_begin, row_end):
+                    local_j = articulation_block_cols[row_entry]
+                    if local_j < local_i:
+                        accum = float(0.0)
+                        for col in range(6):
+                            accum = accum + _scalar_block_get(
+                                values_scalar, row_entry, warp_lane, col
+                            ) * _scalar_vec_get(delta_scalar, body_start + local_j, col)
+                        value = value - accum
+                _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
+            _warp_sync()
+            if warp_lane == 0:
+                _lower_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
+            _warp_sync()
+        _cta_sync()
+
+    # ---- back substitution: levels root-to-leaf ----
+    for level_rev in range(num_levels):
+        level = num_levels - 1 - level_rev
+        lv_begin = articulation_level_starts[level_base + level]
+        lv_end = articulation_level_starts[level_base + level + 1]
+        for cursor in range(lv_begin + warp, lv_end, warp_count):
+            local_i = articulation_level_bodies[cursor]
+            row_i = body_start + local_i
+            if warp_lane < _SPARSE_BLOCK_DIM:
+                value = _scalar_vec_get(delta_scalar, row_i, warp_lane)
+                col_begin = articulation_block_col_offsets[row_i]
+                col_end = articulation_block_col_offsets[row_i + 1]
+                for col_entry in range(col_begin, col_end):
+                    local_j = articulation_block_col_rows[col_entry]
+                    slot_ji = articulation_block_col_slots[col_entry]
+                    accum = float(0.0)
+                    for col in range(6):
+                        accum = accum + _scalar_block_get(values_scalar, slot_ji, col, warp_lane) * _scalar_vec_get(
+                            delta_scalar, body_start + local_j, col
+                        )
+                    value = value - accum
+                _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
+            _warp_sync()
+            if warp_lane == 0:
+                _upper_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
+            _warp_sync()
+        _cta_sync()

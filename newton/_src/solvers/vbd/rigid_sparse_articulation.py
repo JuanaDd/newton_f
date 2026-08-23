@@ -32,10 +32,14 @@ class RigidArticulationSparseLayout:
     articulation_diag_slots: wp.array
     body_articulation_sparse: wp.array
     body_articulation_local: wp.array
+    articulation_level_offsets: wp.array
+    articulation_level_bodies: wp.array
+    articulation_level_starts: wp.array
     articulation_count: int
     articulation_body_count: int
     articulation_joint_count: int
     block_count: int
+    max_level_count: int
 
 
 def _symbolic_cholesky_pattern(body_count: int, edges: set[tuple[int, int]]) -> list[list[int]]:
@@ -75,6 +79,42 @@ def _minimum_degree_order(body_count: int, edges: set[tuple[int, int]]) -> list[
     return order
 
 
+def _elimination_levels(pattern: list[list[int]]) -> list[list[int]]:
+    """Group elimination pivots into dependency levels.
+
+    ``pattern`` is the symbolic Cholesky row structure. The elimination tree
+    parent of column ``k`` is the smallest row index below the diagonal in
+    column ``k``; a pivot may be eliminated once all of its elimination-tree
+    children are done. Pivots in the same level are mutually independent:
+    their Schur updates only touch blocks whose row/column indices are their
+    own elimination-tree ancestors, and same-level pivots are never ancestors
+    of each other.
+    """
+    n = len(pattern)
+    children: list[list[int]] = [[] for _ in range(n)]
+    for k in range(n):
+        parent = n
+        for row in range(k + 1, n):
+            if k in pattern[row]:
+                parent = row
+                break
+        if parent < n:
+            children[parent].append(k)
+
+    level = [0] * n
+    # pattern rows only reference earlier columns, so children are always
+    # processed before their parent in index order.
+    for k in range(n):
+        for c in children[k]:
+            level[k] = max(level[k], level[c] + 1)
+
+    num_levels = max(level) + 1 if n > 0 else 0
+    levels: list[list[int]] = [[] for _ in range(num_levels)]
+    for k in range(n):
+        levels[level[k]].append(k)
+    return levels
+
+
 def build_rigid_articulation_sparse_layout(
     model, device: wp.context.Devicelike
 ) -> RigidArticulationSparseLayout | None:
@@ -103,6 +143,10 @@ def build_rigid_articulation_sparse_layout(
     schur_right_slots_host: list[int] = []
     schur_offsets_host: list[int] = []
     diag_slots_host: list[int] = []
+    level_offsets_host = [0]
+    level_bodies_host: list[int] = []
+    level_starts_host: list[int] = []
+    max_level_count = 0
 
     body_articulation_sparse_host = np.full((model.body_count,), -1, dtype=np.int32)
     body_articulation_local_host = np.full((model.body_count,), -1, dtype=np.int32)
@@ -150,6 +194,14 @@ def build_rigid_articulation_sparse_layout(
             ordered_bodies = bodies
 
         pattern = _symbolic_cholesky_pattern(len(ordered_bodies), edges)
+
+        levels = _elimination_levels(pattern)
+        max_level_count = max(max_level_count, len(levels))
+        for level_pivots in levels:
+            level_starts_host.append(len(level_bodies_host))
+            level_bodies_host.extend(level_pivots)
+        level_starts_host.append(len(level_bodies_host))
+        level_offsets_host.append(len(level_starts_host))
 
         body_start = len(articulation_bodies_host)
         articulation_bodies_host.extend(ordered_bodies)
@@ -210,6 +262,9 @@ def build_rigid_articulation_sparse_layout(
     schur_left_slots_np = np.asarray(schur_left_slots_host, dtype=np.int32)
     schur_right_slots_np = np.asarray(schur_right_slots_host, dtype=np.int32)
     diag_slots_np = np.asarray(diag_slots_host, dtype=np.int32)
+    level_offsets_np = np.asarray(level_offsets_host, dtype=np.int32)
+    level_bodies_np = np.asarray(level_bodies_host, dtype=np.int32)
+    level_starts_np = np.asarray(level_starts_host, dtype=np.int32)
 
     return RigidArticulationSparseLayout(
         articulation_body_offsets=wp.array(articulation_body_offsets_np, dtype=wp.int32, device=device),
@@ -229,8 +284,12 @@ def build_rigid_articulation_sparse_layout(
         articulation_diag_slots=wp.array(diag_slots_np, dtype=wp.int32, device=device),
         body_articulation_sparse=wp.array(body_articulation_sparse_host, dtype=wp.int32, device=device),
         body_articulation_local=wp.array(body_articulation_local_host, dtype=wp.int32, device=device),
+        articulation_level_offsets=wp.array(level_offsets_np, dtype=wp.int32, device=device),
+        articulation_level_bodies=wp.array(level_bodies_np, dtype=wp.int32, device=device),
+        articulation_level_starts=wp.array(level_starts_np, dtype=wp.int32, device=device),
         articulation_count=len(articulation_groups),
         articulation_body_count=len(articulation_bodies_host),
         articulation_joint_count=len(articulation_joints_host),
         block_count=len(block_cols_host),
+        max_level_count=max_level_count,
     )

@@ -418,6 +418,7 @@ class Example:
             iterations=getattr(args, "iterations", 8),
             rigid_articulation_solve=solve_mode,
             rigid_joint_armature=solve_mode == "block_sparse_joints",
+            rigid_articulation_level_parallel=getattr(args, "level_parallel", False),
             rigid_articulation_relaxation=0.65,
             rigid_articulation_diagonal_regularization=0.0,
             rigid_avbd_alpha=0.0,
@@ -613,6 +614,9 @@ class Example:
         parser.add_argument("--solve", choices=["local", "block_sparse_joints"], default="block_sparse_joints")
         parser.add_argument("--gravity", type=float, default=-9.81)
         parser.add_argument("--iterations", type=int, default=8)
+        parser.add_argument(
+            "--level-parallel", action="store_true", help="Use the level-scheduled block-sparse solve kernel."
+        )
         parser.add_argument(
             "--drive", choices=["all", "knee", "ankle", "waist"], default="all", help="Which cranks to drive."
         )

@@ -53,6 +53,7 @@ from .rigid_sparse_articulation_kernels import (
     assemble_articulation_joints_scalar,
     mat66f,
     regularize_articulation_body_hessian,
+    solve_articulation_sparse_block32_level,
     solve_articulation_sparse_block32_scalar,
     solve_articulation_sparse_serial,
     vec6f,
@@ -285,6 +286,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-cable angular joint constraints
         rigid_joint_armature: bool = False,
+        rigid_articulation_level_parallel: bool = False,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: controlled by model attributes
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
@@ -531,6 +533,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_joint_armature = rigid_joint_armature
+        self.rigid_articulation_level_parallel = rigid_articulation_level_parallel
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
@@ -3463,28 +3466,55 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
         if use_block32:
-            wp.launch(
-                kernel=solve_articulation_sparse_block32_scalar,
-                dim=layout.articulation_count * 128,
-                inputs=[
-                    layout.articulation_body_offsets,
-                    layout.articulation_block_row_offsets,
-                    layout.articulation_block_cols,
-                    layout.articulation_block_col_offsets,
-                    layout.articulation_block_col_rows,
-                    layout.articulation_block_col_slots,
-                    layout.articulation_schur_offsets,
-                    layout.articulation_schur_dst_slots,
-                    layout.articulation_schur_left_slots,
-                    layout.articulation_schur_right_slots,
-                    layout.articulation_diag_slots,
-                    self.rigid_articulation_sparse_values_scalar,
-                    self.rigid_articulation_sparse_rhs_scalar,
-                ],
-                outputs=[self.rigid_articulation_sparse_delta_scalar],
-                device=self.device,
-                block_dim=128,
-            )
+            if self.rigid_articulation_level_parallel:
+                wp.launch(
+                    kernel=solve_articulation_sparse_block32_level,
+                    dim=layout.articulation_count * 128,
+                    inputs=[
+                        layout.articulation_body_offsets,
+                        layout.articulation_block_row_offsets,
+                        layout.articulation_block_cols,
+                        layout.articulation_block_col_offsets,
+                        layout.articulation_block_col_rows,
+                        layout.articulation_block_col_slots,
+                        layout.articulation_schur_offsets,
+                        layout.articulation_schur_dst_slots,
+                        layout.articulation_schur_left_slots,
+                        layout.articulation_schur_right_slots,
+                        layout.articulation_diag_slots,
+                        layout.articulation_level_offsets,
+                        layout.articulation_level_starts,
+                        layout.articulation_level_bodies,
+                        self.rigid_articulation_sparse_values_scalar,
+                        self.rigid_articulation_sparse_rhs_scalar,
+                    ],
+                    outputs=[self.rigid_articulation_sparse_delta_scalar],
+                    device=self.device,
+                    block_dim=128,
+                )
+            else:
+                wp.launch(
+                    kernel=solve_articulation_sparse_block32_scalar,
+                    dim=layout.articulation_count * 128,
+                    inputs=[
+                        layout.articulation_body_offsets,
+                        layout.articulation_block_row_offsets,
+                        layout.articulation_block_cols,
+                        layout.articulation_block_col_offsets,
+                        layout.articulation_block_col_rows,
+                        layout.articulation_block_col_slots,
+                        layout.articulation_schur_offsets,
+                        layout.articulation_schur_dst_slots,
+                        layout.articulation_schur_left_slots,
+                        layout.articulation_schur_right_slots,
+                        layout.articulation_diag_slots,
+                        self.rigid_articulation_sparse_values_scalar,
+                        self.rigid_articulation_sparse_rhs_scalar,
+                    ],
+                    outputs=[self.rigid_articulation_sparse_delta_scalar],
+                    device=self.device,
+                    block_dim=128,
+                )
 
             wp.launch(
                 kernel=apply_articulation_sparse_delta_scalar,
