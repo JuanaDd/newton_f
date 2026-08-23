@@ -797,6 +797,33 @@ _SCRATCH_RHS_CHILD = wp.constant(114)
 
 
 @wp.func
+def _mat66_from_blocks(ul: wp.mat33, ur: wp.mat33, ll: wp.mat33, lr: wp.mat33) -> mat66f:
+    out = mat66f(0.0)
+    for i in range(3):
+        for j in range(3):
+            out[i, j] = ul[i, j]
+            out[i, j + 3] = ur[i, j]
+            out[i + 3, j] = ll[i, j]
+            out[i + 3, j + 3] = lr[i, j]
+    return out
+
+
+@wp.func
+def _mat66_from_lr(lr: wp.mat33) -> mat66f:
+    out = mat66f(0.0)
+    for i in range(3):
+        for j in range(3):
+            out[i + 3, j + 3] = lr[i, j]
+    return out
+
+
+@wp.func
+def _zero_joint_scratch(joint_scratch: wp.array[float], jb: int):
+    for zi in range(_JOINT_SCRATCH_STRIDE):
+        joint_scratch[jb + zi] = 0.0
+
+
+@wp.func
 def _scratch_add_mat33(joint_scratch: wp.array[float], base: int, row0: int, col0: int, m: wp.mat33):
     for i in range(3):
         for j in range(3):
@@ -868,8 +895,6 @@ def _add_h_blocks_scalar_atomic(
 
 @wp.func
 def _assemble_constraint_pair_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     residual: wp.vec3,
     force_scale: float,
     hessian_scale: float,
@@ -880,9 +905,6 @@ def _assemble_constraint_pair_scalar(
     is_parent_b: bool,
     angular_only: bool,
 ):
-    if force_scale == 0.0 and hessian_scale <= 0.0:
-        return
-
     # Closed-form assembly exploiting the Jacobian block structure:
     #   linear constraint:  J_x = s_x * [P | -P*S(r_x)]
     #   angular constraint: J_x = s_x * [0 | P]
@@ -950,19 +972,29 @@ def _assemble_constraint_pair_scalar(
         ll_bb = -wp.transpose(N_b)
         lr_bb = -S_b * N_b
 
-    # a is always the parent side at every call site; accumulate into the
-    # thread-owned joint scratch (plain RMW, L1-resident).
-    _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_PARENT, rhs_a)
-    _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_CHILD, rhs_b)
-    _scratch_add_h_blocks(joint_scratch, jb + _SCRATCH_H_PARENT, angular_only, ul_aa, ur_aa, ll_aa, lr_aa)
-    _scratch_add_h_blocks(joint_scratch, jb + _SCRATCH_H_CHILD, angular_only, ul_bb, ur_bb, ll_bb, lr_bb)
-    _scratch_add_h_blocks(joint_scratch, jb + _SCRATCH_H_CROSS, angular_only, ul_ab, ur_ab, ll_ab, lr_ab)
+    # a is always the parent side at every call site; contributions are
+    # returned and accumulated in the caller's registers (single scratch
+    # write at kernel end — GPU L1 is write-through, so every store is an
+    # L2 transaction and per-term RMW would multiply the L2 traffic).
+    if angular_only:
+        return (
+            rhs_a,
+            rhs_b,
+            _mat66_from_lr(lr_aa),
+            _mat66_from_lr(lr_ab),
+            _mat66_from_lr(lr_bb),
+        )
+    return (
+        rhs_a,
+        rhs_b,
+        _mat66_from_blocks(ul_aa, ur_aa, ll_aa, lr_aa),
+        _mat66_from_blocks(ul_ab, ur_ab, ll_ab, lr_ab),
+        _mat66_from_blocks(ul_bb, ur_bb, ll_bb, lr_bb),
+    )
 
 
 @wp.func
 def _assemble_constraint_single_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     residual: wp.vec3,
     force_scale: float,
     hessian_scale: float,
@@ -971,9 +1003,6 @@ def _assemble_constraint_single_scalar(
     is_parent: bool,
     angular_only: bool,
 ):
-    if force_scale == 0.0 and hessian_scale <= 0.0:
-        return
-
     # Closed-form: see _assemble_constraint_pair_scalar. With s^2 == 1 the
     # diagonal H block is sign-independent.
     sign = float(1.0)
@@ -1001,33 +1030,32 @@ def _assemble_constraint_single_scalar(
         lr = -S_r * N
 
     # every call site targets the child body of a rootless joint
-    _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_CHILD, rhs_body)
-    _scratch_add_h_blocks(joint_scratch, jb + _SCRATCH_H_CHILD, angular_only, ul, ur, ll, lr)
+    if angular_only:
+        return rhs_body, _mat66_from_lr(lr)
+    return rhs_body, _mat66_from_blocks(ul, ur, ll, lr)
 
 
 @wp.func
 def _assemble_angular_direct_pair_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     has_parent: bool,
     torque_parent: wp.vec3,
     H_aa: wp.mat33,
 ):
+    H66 = _mat66_from_lr(H_aa)
+    rhs_c = _vec6_from_parts(wp.vec3(0.0), -torque_parent)
     if has_parent:
-        _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_PARENT, _vec6_from_parts(wp.vec3(0.0), torque_parent))
-        _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_CHILD, _vec6_from_parts(wp.vec3(0.0), -torque_parent))
-        _scratch_add_mat33(joint_scratch, jb + _SCRATCH_H_PARENT, 3, 3, H_aa)
-        _scratch_add_mat33(joint_scratch, jb + _SCRATCH_H_CHILD, 3, 3, H_aa)
-        _scratch_add_mat33(joint_scratch, jb + _SCRATCH_H_CROSS, 3, 3, -H_aa)
-    else:
-        _scratch_add_rhs(joint_scratch, jb + _SCRATCH_RHS_CHILD, _vec6_from_parts(wp.vec3(0.0), -torque_parent))
-        _scratch_add_mat33(joint_scratch, jb + _SCRATCH_H_CHILD, 3, 3, H_aa)
+        return (
+            _vec6_from_parts(wp.vec3(0.0), torque_parent),
+            rhs_c,
+            H66,
+            _mat66_from_lr(-H_aa),
+            H66,
+        )
+    return vec6f(0.0), rhs_c, mat66f(0.0), mat66f(0.0), H66
 
 
 @wp.func
 def _assemble_linear_joint_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     has_parent: bool,
     parent_body: int,
     child_body: int,
@@ -1061,9 +1089,7 @@ def _assemble_linear_joint_scalar(
     if has_parent:
         parent_pose = body_q[parent_body]
         r_parent = parent_anchor - wp.transform_point(parent_pose, body_com[parent_body])
-        _assemble_constraint_pair_scalar(
-            joint_scratch,
-            jb,
+        return _assemble_constraint_pair_scalar(
             force_residual,
             1.0,
             hessian_scale,
@@ -1075,9 +1101,7 @@ def _assemble_linear_joint_scalar(
             False,
         )
     else:
-        _assemble_constraint_single_scalar(
-            joint_scratch,
-            jb,
+        rhs_c, H_cc = _assemble_constraint_single_scalar(
             force_residual,
             1.0,
             hessian_scale,
@@ -1086,12 +1110,11 @@ def _assemble_linear_joint_scalar(
             False,
             False,
         )
+        return vec6f(0.0), rhs_c, mat66f(0.0), mat66f(0.0), H_cc
 
 
 @wp.func
 def _assemble_angular_joint_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     has_parent: bool,
     parent_anchor_q: wp.quat,
     child_anchor_q: wp.quat,
@@ -1126,20 +1149,16 @@ def _assemble_angular_joint_scalar(
         damping,
         dt,
     )
-    _assemble_angular_direct_pair_scalar(
-        joint_scratch,
-        jb,
+    rhs_p, rhs_c, H_pp, H_pc, H_cc = _assemble_angular_direct_pair_scalar(
         has_parent,
         torque_parent,
         H_aa,
     )
-    return kappa, J_world
+    return kappa, J_world, rhs_p, rhs_c, H_pp, H_pc, H_cc
 
 
 @wp.func
 def _assemble_linear_axis_row_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     has_parent: bool,
     parent_body: int,
     child_body: int,
@@ -1159,9 +1178,7 @@ def _assemble_linear_axis_row_scalar(
     if has_parent:
         parent_pose = body_q[parent_body]
         r_parent = parent_anchor - wp.transform_point(parent_pose, body_com[parent_body])
-        _assemble_constraint_pair_scalar(
-            joint_scratch,
-            jb,
+        return _assemble_constraint_pair_scalar(
             residual,
             force_scalar,
             hessian_scalar,
@@ -1172,24 +1189,20 @@ def _assemble_linear_axis_row_scalar(
             False,
             False,
         )
-    else:
-        _assemble_constraint_single_scalar(
-            joint_scratch,
-            jb,
-            residual,
-            force_scalar,
-            hessian_scalar,
-            P,
-            r_child,
-            False,
-            False,
-        )
+    rhs_c, H_cc = _assemble_constraint_single_scalar(
+        residual,
+        force_scalar,
+        hessian_scalar,
+        P,
+        r_child,
+        False,
+        False,
+    )
+    return vec6f(0.0), rhs_c, mat66f(0.0), mat66f(0.0), H_cc
 
 
 @wp.func
 def _assemble_angular_axis_row_scalar(
-    joint_scratch: wp.array[float],
-    jb: int,
     has_parent: bool,
     angular_jacobian_world: wp.vec3,
     force_scalar: float,
@@ -1197,9 +1210,7 @@ def _assemble_angular_axis_row_scalar(
 ):
     torque_parent = force_scalar * angular_jacobian_world
     H_aa = hessian_scalar * wp.outer(angular_jacobian_world, angular_jacobian_world)
-    _assemble_angular_direct_pair_scalar(
-        joint_scratch,
-        jb,
+    return _assemble_angular_direct_pair_scalar(
         has_parent,
         torque_parent,
         H_aa,
@@ -1478,18 +1489,17 @@ def assemble_articulation_joints_scalar(
 ):
     joint_cursor = wp.tid()
 
-    # Two-phase assembly: all constraint contributions of this joint accumulate
-    # into a thread-owned scratch region (plain RMW, L1-resident) instead of
-    # atomics into the shared sparse matrix, which are serviced by the L2
-    # atomic units and were the dominant L2 traffic. Zero the region before any
-    # early-out so filtered/disabled joints contribute exactly nothing when the
-    # per-body gather kernel reads it back.
+    # Two-phase assembly, register-accumulated: every constraint contribution
+    # of this joint is summed in registers and written to the thread-owned
+    # scratch region exactly once at the end (GPU L1 is write-through, so each
+    # store is an L2 transaction — per-term RMW would multiply L2 traffic).
+    # Early-outs zero the region so filtered/disabled joints contribute
+    # exactly nothing when the per-body gather kernel reads it back.
     jb = joint_cursor * _JOINT_SCRATCH_STRIDE
-    for zi in range(_JOINT_SCRATCH_STRIDE):
-        joint_scratch[jb + zi] = 0.0
 
     joint = articulation_joints[joint_cursor]
     if not joint_enabled[joint]:
+        _zero_joint_scratch(joint_scratch, jb)
         return
 
     jt = joint_type[joint]
@@ -1501,11 +1511,13 @@ def assemble_articulation_joints_scalar(
         and jt != JointType.PRISMATIC
         and jt != JointType.D6
     ):
+        _zero_joint_scratch(joint_scratch, jb)
         return
 
     child = joint_child[joint]
     parent = joint_parent[joint]
     if child < 0:
+        _zero_joint_scratch(joint_scratch, jb)
         return
 
     body_start = articulation_joint_body_start[joint_cursor]
@@ -1514,6 +1526,13 @@ def assemble_articulation_joints_scalar(
     if parent >= 0:
         parent_local = body_articulation_local[parent]
     has_parent = parent >= 0 and parent_local >= 0
+
+    # Register accumulators for this joint's total contribution.
+    acc_rhs_p = vec6f(0.0)
+    acc_rhs_c = vec6f(0.0)
+    acc_H_pp = mat66f(0.0)
+    acc_H_pc = mat66f(0.0)
+    acc_H_cc = mat66f(0.0)
 
     child_pose = body_q[child]
     child_prev_pose = body_q_prev[child]
@@ -1622,9 +1641,7 @@ def assemble_articulation_joints_scalar(
         kd_angular = joint_penalty_kd[c_start + 1]
 
     if k_linear > 0.0 and (jt != JointType.D6 or lin_count < 3):
-        _assemble_linear_joint_scalar(
-            joint_scratch,
-            jb,
+        d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_linear_joint_scalar(
             has_parent,
             parent,
             child,
@@ -1642,6 +1659,11 @@ def assemble_articulation_joints_scalar(
             lin_C0,
             lin_alpha,
         )
+        acc_rhs_p = acc_rhs_p + d_rhs_p
+        acc_rhs_c = acc_rhs_c + d_rhs_c
+        acc_H_pp = acc_H_pp + d_H_pp
+        acc_H_pc = acc_H_pc + d_H_pc
+        acc_H_cc = acc_H_cc + d_H_cc
 
     kappa_cached = wp.vec3(0.0)
     J_world_cached = wp.mat33(0.0)
@@ -1652,9 +1674,7 @@ def assemble_articulation_joints_scalar(
         if jt == JointType.CABLE and ang_hard == 0:
             sigma0 = joint_sigma_start[joint]
             C_fric = joint_C_fric[joint]
-        kappa_cached, J_world_cached = _assemble_angular_joint_scalar(
-            joint_scratch,
-            jb,
+        kappa_cached, J_world_cached, d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_angular_joint_scalar(
             has_parent,
             parent_anchor_q,
             child_anchor_q,
@@ -1672,6 +1692,11 @@ def assemble_articulation_joints_scalar(
             ang_C0,
             ang_alpha,
         )
+        acc_rhs_p = acc_rhs_p + d_rhs_p
+        acc_rhs_c = acc_rhs_c + d_rhs_c
+        acc_H_pp = acc_H_pp + d_H_pp
+        acc_H_pc = acc_H_pc + d_H_pc
+        acc_H_cc = acc_H_cc + d_H_cc
         has_angular_cache = True
 
     if enable_joint_armature and jt == JointType.REVOLUTE:
@@ -1690,14 +1715,17 @@ def assemble_articulation_joints_scalar(
             armature_jacobian_world = armature_J_world * axis_local
             armature_hessian = armature / (dt * dt)
             armature_force = armature_hessian * wp.dot(armature_kappa, axis_local)
-            _assemble_angular_axis_row_scalar(
-                joint_scratch,
-                jb,
+            d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_angular_axis_row_scalar(
                 has_parent,
                 armature_jacobian_world,
                 armature_force,
                 armature_hessian,
             )
+            acc_rhs_p = acc_rhs_p + d_rhs_p
+            acc_rhs_c = acc_rhs_c + d_rhs_c
+            acc_H_pp = acc_H_pp + d_H_pp
+            acc_H_pc = acc_H_pc + d_H_pc
+            acc_H_cc = acc_H_cc + d_H_cc
 
     if jt == JointType.REVOLUTE:
         dof_idx = qd_start
@@ -1745,14 +1773,17 @@ def assemble_articulation_joints_scalar(
 
             if hessian_scalar > 0.0:
                 angular_jacobian_world = J_world * axis_local
-                _assemble_angular_axis_row_scalar(
-                    joint_scratch,
-                    jb,
+                d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_angular_axis_row_scalar(
                     has_parent,
                     angular_jacobian_world,
                     force_scalar,
                     hessian_scalar,
                 )
+                acc_rhs_p = acc_rhs_p + d_rhs_p
+                acc_rhs_c = acc_rhs_c + d_rhs_c
+                acc_H_pp = acc_H_pp + d_H_pp
+                acc_H_pc = acc_H_pc + d_H_pc
+                acc_H_cc = acc_H_cc + d_H_cc
 
     if jt == JointType.PRISMATIC:
         dof_idx = qd_start
@@ -1789,9 +1820,7 @@ def assemble_articulation_joints_scalar(
                 hessian_scalar = drive_ke + drive_kd / dt
 
             if hessian_scalar > 0.0:
-                _assemble_linear_axis_row_scalar(
-                    joint_scratch,
-                    jb,
+                d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_linear_axis_row_scalar(
                     has_parent,
                     parent,
                     child,
@@ -1803,6 +1832,11 @@ def assemble_articulation_joints_scalar(
                     force_scalar,
                     hessian_scalar,
                 )
+                acc_rhs_p = acc_rhs_p + d_rhs_p
+                acc_rhs_c = acc_rhs_c + d_rhs_c
+                acc_H_pp = acc_H_pp + d_H_pp
+                acc_H_pc = acc_H_pc + d_H_pc
+                acc_H_cc = acc_H_cc + d_H_cc
 
     if jt == JointType.D6:
         C_vec = child_anchor - parent_anchor
@@ -1843,9 +1877,7 @@ def assemble_articulation_joints_scalar(
                         hessian_scalar = drive_ke + drive_kd / dt
 
                     if hessian_scalar > 0.0:
-                        _assemble_linear_axis_row_scalar(
-                            joint_scratch,
-                            jb,
+                        d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_linear_axis_row_scalar(
                             has_parent,
                             parent,
                             child,
@@ -1857,6 +1889,11 @@ def assemble_articulation_joints_scalar(
                             force_scalar,
                             hessian_scalar,
                         )
+                        acc_rhs_p = acc_rhs_p + d_rhs_p
+                        acc_rhs_c = acc_rhs_c + d_rhs_c
+                        acc_H_pp = acc_H_pp + d_H_pp
+                        acc_H_pc = acc_H_pc + d_H_pc
+                        acc_H_cc = acc_H_cc + d_H_cc
 
         if ang_count > 0:
             kappa = kappa_cached
@@ -1905,21 +1942,32 @@ def assemble_articulation_joints_scalar(
 
                         if hessian_scalar > 0.0:
                             angular_jacobian_world = J_world * axis_local
-                            _assemble_angular_axis_row_scalar(
-                                joint_scratch,
-                                jb,
+                            d_rhs_p, d_rhs_c, d_H_pp, d_H_pc, d_H_cc = _assemble_angular_axis_row_scalar(
                                 has_parent,
                                 angular_jacobian_world,
                                 force_scalar,
                                 hessian_scalar,
                             )
+                            acc_rhs_p = acc_rhs_p + d_rhs_p
+                            acc_rhs_c = acc_rhs_c + d_rhs_c
+                            acc_H_pp = acc_H_pp + d_H_pp
+                            acc_H_pc = acc_H_pc + d_H_pc
+                            acc_H_cc = acc_H_cc + d_H_cc
 
 
-    # ---- flush phase: write this joint's off-diagonal block into the sparse
-    # matrix once (36 atomics instead of 36 per constraint term). The diagonal
-    # contributions and rhs stay in scratch and are gathered per body (with
-    # exclusive, non-atomic accumulation) by
-    # gather_articulation_joint_diagonals_scalar.
+    # ---- single write-out: the joint's total contribution goes from registers
+    # to its scratch region exactly once (plain overwriting stores; the
+    # per-body gather kernel accumulates the diagonals/rhs without atomics),
+    # and the off-diagonal block is flushed straight from registers into the
+    # sparse matrix (36 atomics per joint).
+    for wi in range(6):
+        for wj in range(6):
+            joint_scratch[jb + _SCRATCH_H_PARENT + wi * 6 + wj] = acc_H_pp[wi, wj]
+            joint_scratch[jb + _SCRATCH_H_CHILD + wi * 6 + wj] = acc_H_cc[wi, wj]
+    for wi in range(6):
+        joint_scratch[jb + _SCRATCH_RHS_PARENT + wi] = acc_rhs_p[wi]
+        joint_scratch[jb + _SCRATCH_RHS_CHILD + wi] = acc_rhs_c[wi]
+
     if has_parent:
         if parent_local >= child_local:
             slot_pc = _find_block_slot(
@@ -1928,11 +1976,7 @@ def assemble_articulation_joints_scalar(
             if slot_pc >= 0:
                 for fi in range(6):
                     for fj in range(6):
-                        wp.atomic_add(
-                            values_scalar,
-                            _scalar_block_index(slot_pc, fi, fj),
-                            joint_scratch[jb + _SCRATCH_H_CROSS + fi * 6 + fj],
-                        )
+                        wp.atomic_add(values_scalar, _scalar_block_index(slot_pc, fi, fj), acc_H_pc[fi, fj])
         else:
             slot_cp = _find_block_slot(
                 articulation_block_row_offsets, articulation_block_cols, body_start, child_local, parent_local
@@ -1940,11 +1984,7 @@ def assemble_articulation_joints_scalar(
             if slot_cp >= 0:
                 for fi in range(6):
                     for fj in range(6):
-                        wp.atomic_add(
-                            values_scalar,
-                            _scalar_block_index(slot_cp, fi, fj),
-                            joint_scratch[jb + _SCRATCH_H_CROSS + fj * 6 + fi],
-                        )
+                        wp.atomic_add(values_scalar, _scalar_block_index(slot_cp, fi, fj), acc_H_pc[fj, fi])
 
 @wp.func
 def _cholesky66_scalar(values: wp.array[float], slot: int):
