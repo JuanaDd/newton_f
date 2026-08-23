@@ -3496,7 +3496,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             if self.rigid_articulation_level_parallel:
                 wp.launch(
                     kernel=solve_articulation_sparse_block32_level,
-                    dim=layout.articulation_count * 128,
+                    dim=layout.articulation_count * 32,
                     inputs=[
                         layout.articulation_body_offsets,
                         layout.articulation_block_row_offsets,
@@ -3517,7 +3517,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     ],
                     outputs=[self.rigid_articulation_sparse_delta_scalar],
                     device=self.device,
-                    block_dim=128,
+                    block_dim=32,
                 )
             else:
                 wp.launch(
