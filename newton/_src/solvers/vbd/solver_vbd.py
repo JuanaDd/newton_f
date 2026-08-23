@@ -51,6 +51,7 @@ from .rigid_sparse_articulation_kernels import (
     apply_articulation_sparse_delta_scalar,
     assemble_articulation_body_diagonal_scalar,
     assemble_articulation_joints_scalar,
+    gather_articulation_joint_diagonals_scalar,
     mat66f,
     regularize_articulation_body_hessian,
     solve_articulation_sparse_block32_level,
@@ -610,6 +611,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     )
                     self.rigid_articulation_sparse_delta_scalar = wp.zeros(
                         self.rigid_articulation_sparse_layout.articulation_body_count * 6,
+                        dtype=float,
+                        device=self.device,
+                    )
+                    # Per-joint scratch for the two-phase assembly (120 floats per joint).
+                    self.rigid_articulation_joint_scratch = wp.zeros(
+                        self.rigid_articulation_sparse_layout.articulation_joint_count * 120,
                         dtype=float,
                         device=self.device,
                     )
@@ -3441,9 +3448,29 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_joint_armature,
                     self.rigid_joint_alpha,
                 ],
-                outputs=[self.rigid_articulation_sparse_values_scalar, self.rigid_articulation_sparse_rhs_scalar],
+                outputs=[
+                    self.rigid_articulation_sparse_values_scalar,
+                    self.rigid_articulation_sparse_rhs_scalar,
+                    self.rigid_articulation_joint_scratch,
+                ],
                 device=self.device,
                 block_dim=128,
+            )
+
+            # Phase 2 of the two-phase assembly: exclusive per-body gather of the
+            # joints' diagonal/rhs scratch contributions (no atomics).
+            wp.launch(
+                kernel=gather_articulation_joint_diagonals_scalar,
+                dim=(layout.articulation_body_count, 42),
+                inputs=[
+                    layout.body_joint_offsets,
+                    layout.body_joint_entries,
+                    self.rigid_articulation_joint_scratch,
+                    self.rigid_articulation_sparse_values_scalar,
+                    self.rigid_articulation_sparse_rhs_scalar,
+                    layout.articulation_diag_slots,
+                ],
+                device=self.device,
             )
 
         if not use_block32:

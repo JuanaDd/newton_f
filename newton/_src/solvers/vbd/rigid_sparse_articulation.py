@@ -35,6 +35,8 @@ class RigidArticulationSparseLayout:
     articulation_level_offsets: wp.array
     articulation_level_bodies: wp.array
     articulation_level_starts: wp.array
+    body_joint_offsets: wp.array
+    body_joint_entries: wp.array
     articulation_count: int
     articulation_body_count: int
     articulation_joint_count: int
@@ -245,6 +247,31 @@ def build_rigid_articulation_sparse_layout(
                     schur_left_slots_host.append(left_slot)
                     schur_right_slots_host.append(right_slot)
 
+    # Body -> (joint, side) CSR for the two-phase assembly gather kernel.
+    # Row indexing matches the articulation body rows; entry = joint_cursor * 2
+    # + side (0 = parent side, 1 = child side).
+    row_entries: list[list[int]] = [[] for _ in range(len(articulation_bodies_host))]
+    for jc, joint_idx in enumerate(articulation_joints_host):
+        child = int(joint_child[joint_idx])
+        if child < 0:
+            continue
+        bs = int(articulation_joint_body_start_host[jc])
+        cl = int(body_articulation_local_host[child])
+        if cl >= 0:
+            row_entries[bs + cl].append(jc * 2 + 1)
+        parent = int(joint_parent[joint_idx])
+        if parent >= 0:
+            pl = int(body_articulation_local_host[parent])
+            if pl >= 0:
+                row_entries[bs + pl].append(jc * 2)
+    body_joint_offsets_host = [0]
+    body_joint_entries_host: list[int] = []
+    for entries in row_entries:
+        body_joint_entries_host.extend(entries)
+        body_joint_offsets_host.append(len(body_joint_entries_host))
+    body_joint_offsets_np = np.asarray(body_joint_offsets_host, dtype=np.int32)
+    body_joint_entries_np = np.asarray(body_joint_entries_host, dtype=np.int32)
+
     articulation_bodies_np = np.asarray(articulation_bodies_host, dtype=np.int32)
     articulation_joints_np = np.asarray(articulation_joints_host, dtype=np.int32)
     articulation_joint_body_start_np = np.asarray(articulation_joint_body_start_host, dtype=np.int32)
@@ -287,6 +314,8 @@ def build_rigid_articulation_sparse_layout(
         articulation_level_offsets=wp.array(level_offsets_np, dtype=wp.int32, device=device),
         articulation_level_bodies=wp.array(level_bodies_np, dtype=wp.int32, device=device),
         articulation_level_starts=wp.array(level_starts_np, dtype=wp.int32, device=device),
+        body_joint_offsets=wp.array(body_joint_offsets_np, dtype=wp.int32, device=device),
+        body_joint_entries=wp.array(body_joint_entries_np, dtype=wp.int32, device=device),
         articulation_count=len(articulation_groups),
         articulation_body_count=len(articulation_bodies_host),
         articulation_joint_count=len(articulation_joints_host),
