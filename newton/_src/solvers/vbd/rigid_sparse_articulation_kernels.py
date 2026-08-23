@@ -780,6 +780,45 @@ def _add_rhs_scalar_atomic(rhs_scalar: wp.array[float], index: int, value: vec6f
 
 
 @wp.func
+def _add_block33_scalar_atomic(values_scalar: wp.array[float], slot: int, row0: int, col0: int, m: wp.mat33):
+    """Atomically accumulate a 3x3 sub-block into a 6x6 block slot."""
+    if slot >= 0:
+        for i in range(3):
+            for j in range(3):
+                wp.atomic_add(values_scalar, _scalar_block_index(slot, row0 + i, col0 + j), m[i, j])
+
+
+@wp.func
+def _add_h_blocks_scalar_atomic(
+    values_scalar: wp.array[float],
+    slot: int,
+    transpose: bool,
+    angular_only: bool,
+    ul: wp.mat33,
+    ur: wp.mat33,
+    ll: wp.mat33,
+    lr: wp.mat33,
+):
+    """Accumulate H = [[ul, ur], [ll, lr]] (or its transpose) into a block slot.
+
+    For angular-only constraints the ul/ur/ll sub-blocks are exactly zero and
+    are skipped entirely (saves 3/4 of the atomic traffic).
+    """
+    if transpose:
+        if not angular_only:
+            _add_block33_scalar_atomic(values_scalar, slot, 0, 0, wp.transpose(ul))
+            _add_block33_scalar_atomic(values_scalar, slot, 0, 3, wp.transpose(ll))
+            _add_block33_scalar_atomic(values_scalar, slot, 3, 0, wp.transpose(ur))
+        _add_block33_scalar_atomic(values_scalar, slot, 3, 3, wp.transpose(lr))
+    else:
+        if not angular_only:
+            _add_block33_scalar_atomic(values_scalar, slot, 0, 0, ul)
+            _add_block33_scalar_atomic(values_scalar, slot, 0, 3, ur)
+            _add_block33_scalar_atomic(values_scalar, slot, 3, 0, ll)
+        _add_block33_scalar_atomic(values_scalar, slot, 3, 3, lr)
+
+
+@wp.func
 def _assemble_constraint_pair_scalar(
     values_scalar: wp.array[float],
     rhs_scalar: wp.array[float],
@@ -801,55 +840,91 @@ def _assemble_constraint_pair_scalar(
     if force_scale == 0.0 and hessian_scale <= 0.0:
         return
 
+    # Closed-form assembly exploiting the Jacobian block structure:
+    #   linear constraint:  J_x = s_x * [P | -P*S(r_x)]
+    #   angular constraint: J_x = s_x * [0 | P]
+    # with s_x = -1 for the parent side. Hence, with M = h*P^T*P and
+    # N_x = M*S(r_x):
+    #   h*J_x^T*J_y = s_x*s_y * [[M, -N_y], [-N_x^T, -S(r_x)*N_y]]  (linear)
+    #   h*J_x^T*J_y = s_x*s_y * [[0,  0  ], [0,      M          ]]  (angular)
+    #   -f*J_x^T*residual = -f*s_x * [u; r_x x u], u = P^T*residual (linear)
+    #                     = -f*s_x * [0; u]                          (angular)
+    # This replaces the 6x3x6 element loops (which recomputed each Jacobian
+    # entry 6x) with a handful of 3x3 products and avoids materializing any
+    # 6x6 accumulator, cutting both FLOPs and register pressure.
+    s_a = float(1.0)
+    if is_parent_a:
+        s_a = -1.0
+    s_b = float(1.0)
+    if is_parent_b:
+        s_b = -1.0
+    s_ab = s_a * s_b
+
+    M = hessian_scale * (wp.transpose(P) * P)
+    u = wp.transpose(P) * residual
+
     rhs_a = vec6f(0.0)
     rhs_b = vec6f(0.0)
-    H_aa = mat66f(0.0)
-    H_ab = mat66f(0.0)
-    H_bb = mat66f(0.0)
+    ul_aa = wp.mat33(0.0)
+    ur_aa = wp.mat33(0.0)
+    ll_aa = wp.mat33(0.0)
+    lr_aa = wp.mat33(0.0)
+    ul_ab = wp.mat33(0.0)
+    ur_ab = wp.mat33(0.0)
+    ll_ab = wp.mat33(0.0)
+    lr_ab = wp.mat33(0.0)
+    ul_bb = wp.mat33(0.0)
+    ur_bb = wp.mat33(0.0)
+    ll_bb = wp.mat33(0.0)
+    lr_bb = wp.mat33(0.0)
 
-    for i in range(6):
-        accum_a = float(0.0)
-        accum_b = float(0.0)
-        for c in range(3):
-            if angular_only:
-                Ja = _joint_angular_jacobian_value(P, is_parent_a, c, i)
-                Jb = _joint_angular_jacobian_value(P, is_parent_b, c, i)
-            else:
-                Ja = _joint_linear_jacobian_value(P, r_a, is_parent_a, c, i)
-                Jb = _joint_linear_jacobian_value(P, r_b, is_parent_b, c, i)
-            accum_a = accum_a + Ja * residual[c]
-            accum_b = accum_b + Jb * residual[c]
-            for j in range(6):
-                if angular_only:
-                    Ja_j = _joint_angular_jacobian_value(P, is_parent_a, c, j)
-                    Jb_j = _joint_angular_jacobian_value(P, is_parent_b, c, j)
-                else:
-                    Ja_j = _joint_linear_jacobian_value(P, r_a, is_parent_a, c, j)
-                    Jb_j = _joint_linear_jacobian_value(P, r_b, is_parent_b, c, j)
-                H_aa[i, j] = H_aa[i, j] + hessian_scale * Ja * Ja_j
-                H_ab[i, j] = H_ab[i, j] + hessian_scale * Ja * Jb_j
-                H_bb[i, j] = H_bb[i, j] + hessian_scale * Jb * Jb_j
-        rhs_a[i] = -force_scale * accum_a
-        rhs_b[i] = -force_scale * accum_b
+    if angular_only:
+        rhs_a = _vec6_from_parts(wp.vec3(0.0), (-force_scale * s_a) * u)
+        rhs_b = _vec6_from_parts(wp.vec3(0.0), (-force_scale * s_b) * u)
+        lr_aa = M
+        lr_ab = s_ab * M
+        lr_bb = M
+    else:
+        rhs_a = (-force_scale * s_a) * _vec6_from_parts(u, wp.cross(r_a, u))
+        rhs_b = (-force_scale * s_b) * _vec6_from_parts(u, wp.cross(r_b, u))
+        S_a = wp.skew(r_a)
+        S_b = wp.skew(r_b)
+        N_a = M * S_a
+        N_b = M * S_b
+        # H_aa (s_a^2 == 1)
+        ul_aa = M
+        ur_aa = -N_a
+        ll_aa = -wp.transpose(N_a)
+        lr_aa = -S_a * N_a
+        # H_ab
+        ul_ab = s_ab * M
+        ur_ab = (-s_ab) * N_b
+        ll_ab = (-s_ab) * wp.transpose(N_a)
+        lr_ab = (-s_ab) * (S_a * N_b)
+        # H_bb (s_b^2 == 1)
+        ul_bb = M
+        ur_bb = -N_b
+        ll_bb = -wp.transpose(N_b)
+        lr_bb = -S_b * N_b
 
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_a, rhs_a)
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_b, rhs_b)
 
     slot_aa = _find_block_slot(articulation_block_row_offsets, articulation_block_cols, body_start, local_a, local_a)
     slot_bb = _find_block_slot(articulation_block_row_offsets, articulation_block_cols, body_start, local_b, local_b)
-    _add_mat66_scalar_atomic(values_scalar, slot_aa, H_aa)
-    _add_mat66_scalar_atomic(values_scalar, slot_bb, H_bb)
+    _add_h_blocks_scalar_atomic(values_scalar, slot_aa, False, angular_only, ul_aa, ur_aa, ll_aa, lr_aa)
+    _add_h_blocks_scalar_atomic(values_scalar, slot_bb, False, angular_only, ul_bb, ur_bb, ll_bb, lr_bb)
 
     if local_a >= local_b:
         slot_ab = _find_block_slot(
             articulation_block_row_offsets, articulation_block_cols, body_start, local_a, local_b
         )
-        _add_mat66_scalar_atomic(values_scalar, slot_ab, H_ab)
+        _add_h_blocks_scalar_atomic(values_scalar, slot_ab, False, angular_only, ul_ab, ur_ab, ll_ab, lr_ab)
     else:
         slot_ba = _find_block_slot(
             articulation_block_row_offsets, articulation_block_cols, body_start, local_b, local_a
         )
-        _add_mat66_scalar_atomic(values_scalar, slot_ba, wp.transpose(H_ab))
+        _add_h_blocks_scalar_atomic(values_scalar, slot_ba, True, angular_only, ul_ab, ur_ab, ll_ab, lr_ab)
 
 
 @wp.func
@@ -871,27 +946,35 @@ def _assemble_constraint_single_scalar(
     if force_scale == 0.0 and hessian_scale <= 0.0:
         return
 
+    # Closed-form: see _assemble_constraint_pair_scalar. With s^2 == 1 the
+    # diagonal H block is sign-independent.
+    sign = float(1.0)
+    if is_parent:
+        sign = -1.0
+
+    M = hessian_scale * (wp.transpose(P) * P)
+    u = wp.transpose(P) * residual
+
     rhs_body = vec6f(0.0)
-    H = mat66f(0.0)
-    for i in range(6):
-        accum = float(0.0)
-        for c in range(3):
-            if angular_only:
-                Ji = _joint_angular_jacobian_value(P, is_parent, c, i)
-            else:
-                Ji = _joint_linear_jacobian_value(P, r, is_parent, c, i)
-            accum = accum + Ji * residual[c]
-            for j in range(6):
-                if angular_only:
-                    Jj = _joint_angular_jacobian_value(P, is_parent, c, j)
-                else:
-                    Jj = _joint_linear_jacobian_value(P, r, is_parent, c, j)
-                H[i, j] = H[i, j] + hessian_scale * Ji * Jj
-        rhs_body[i] = -force_scale * accum
+    ul = wp.mat33(0.0)
+    ur = wp.mat33(0.0)
+    ll = wp.mat33(0.0)
+    lr = wp.mat33(0.0)
+    if angular_only:
+        rhs_body = _vec6_from_parts(wp.vec3(0.0), (-force_scale * sign) * u)
+        lr = M
+    else:
+        rhs_body = (-force_scale * sign) * _vec6_from_parts(u, wp.cross(r, u))
+        S_r = wp.skew(r)
+        N = M * S_r
+        ul = M
+        ur = -N
+        ll = -wp.transpose(N)
+        lr = -S_r * N
 
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_body, rhs_body)
     slot = _find_block_slot(articulation_block_row_offsets, articulation_block_cols, body_start, local_body, local_body)
-    _add_mat66_scalar_atomic(values_scalar, slot, H)
+    _add_h_blocks_scalar_atomic(values_scalar, slot, False, angular_only, ul, ur, ll, lr)
 
 
 @wp.func
