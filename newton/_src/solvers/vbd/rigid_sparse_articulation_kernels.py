@@ -780,20 +780,18 @@ def _add_rhs_scalar_atomic(rhs_scalar: wp.array[float], index: int, value: vec6f
 
 
 # Per-joint scratch layout for two-phase assembly [floats]:
-#   [0:36)    H contribution to the parent diagonal block
-#   [36:72)   H contribution to the child diagonal block
-#   [72:108)  H off-diagonal block, stored as [parent-row, child-col]
-#   [108:114) rhs contribution to the parent
-#   [114:120) rhs contribution to the child
-# The scratch region of a joint is owned by exactly one thread, so all
-# accumulation is plain (non-atomic) read-modify-write that stays in L1,
-# unlike atomics which are serviced by the L2 atomic units.
-_JOINT_SCRATCH_STRIDE = wp.constant(120)
+#   [0:36)  H contribution to the parent diagonal block
+#   [36:72) H contribution to the child diagonal block
+#   [72:78) rhs contribution to the parent
+#   [78:84) rhs contribution to the child
+# The off-diagonal block never goes through scratch: it is flushed straight
+# from registers by the assembly kernel. Each joint's region is written once
+# by its owning thread and read by the per-body gather kernel.
+_JOINT_SCRATCH_STRIDE = wp.constant(84)
 _SCRATCH_H_PARENT = wp.constant(0)
 _SCRATCH_H_CHILD = wp.constant(36)
-_SCRATCH_H_CROSS = wp.constant(72)
-_SCRATCH_RHS_PARENT = wp.constant(108)
-_SCRATCH_RHS_CHILD = wp.constant(114)
+_SCRATCH_RHS_PARENT = wp.constant(72)
+_SCRATCH_RHS_CHILD = wp.constant(78)
 
 
 @wp.func

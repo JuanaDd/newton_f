@@ -616,7 +616,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     )
                     # Per-joint scratch for the two-phase assembly (120 floats per joint).
                     self.rigid_articulation_joint_scratch = wp.zeros(
-                        self.rigid_articulation_sparse_layout.articulation_joint_count * 120,
+                        self.rigid_articulation_sparse_layout.articulation_joint_count * 84,
                         dtype=float,
                         device=self.device,
                     )
@@ -3290,6 +3290,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_hessian_aa,
                 ],
                 device=self.device,
+                block_dim=128,
             )
 
         if self.rigid_articulation_diagonal_regularization > 0.0:
