@@ -73,6 +73,44 @@ _LOOPS = (
     ("waist_yaw_link", "waist_connect_rhs", "torso_constraint_R_link", "torso_connect_rhs", "waist_rod_R"),
 )
 
+# Same six loops, but anchored on the MJCF's rod sites instead of the URDF's
+# `*_connect_*` marker bodies. The MJCF carries the sole capsules and the
+# per-link collision whitelist, which the URDF does not.
+# (link_a, site_a, link_b, site_b, rod_label)
+_LOOPS_MJCF = (
+    (
+        "left_ankle_pitch_link",
+        "left_ankle_output_rod_site",
+        "left_ankle_A_link",
+        "left_ankle_motor_rod_site",
+        "left_ankle_rod",
+    ),
+    (
+        "right_ankle_pitch_link",
+        "right_ankle_output_rod_site",
+        "right_ankle_A_link",
+        "right_ankle_motor_rod_site",
+        "right_ankle_rod",
+    ),
+    ("left_knee_link", "left_knee_output_rod_site", "left_knee_motor_link", "left_knee_motor_rod_site", "left_knee_rod"),
+    (
+        "right_knee_link",
+        "right_knee_output_rod_site",
+        "right_knee_motor_link",
+        "right_knee_motor_rod_site",
+        "right_knee_rod",
+    ),
+    ("waist_yaw_link", "left_waist_output_rod_site", "torso_constraint_L_link", "left_waist_motor_rod_site", "waist_rod_L"),
+    (
+        "waist_yaw_link",
+        "right_waist_output_rod_site",
+        "torso_constraint_R_link",
+        "right_waist_motor_rod_site",
+        "waist_rod_R",
+    ),
+)
+
+
 # Linkage outputs: constrained by the reconstructed rods, not directly driven.
 _PASSIVE_JOINTS = (
     "left_knee_joint",
@@ -177,6 +215,59 @@ def _find(labels: list[str], suffix: str) -> int:
         if label.rsplit("/", 1)[-1] == suffix:
             return i
     raise KeyError(f"Missing '{suffix}' in {[l.rsplit('/', 1)[-1] for l in labels]}")
+
+
+def _site_world_pos(builder: newton.ModelBuilder, site_label: str) -> np.ndarray:
+    """World position of an imported MJCF site.
+
+    ``add_mjcf`` turns each ``<site>`` into a non-colliding shape on its parent
+    body, so the anchor is the body pose composed with the shape's local xform.
+    """
+    for si, label in enumerate(builder.shape_label):
+        if label.rsplit("/", 1)[-1] != site_label:
+            continue
+        body = builder.shape_body[si]
+        x_b = wp.transform_identity() if body < 0 else wp.transform(*builder.body_q[body])
+        return np.array(x_b * wp.transform(*builder.shape_transform[si]))[:3]
+    raise KeyError(f"Missing site '{site_label}' among the imported shapes")
+
+
+def _size_infinite_planes(builder: newton.ModelBuilder, extent: float) -> int:
+    """Add a drawable, non-colliding companion quad for each infinite plane.
+
+    MuJoCo encodes an unbounded plane as ``size="0 0 spacing"``; the importer
+    carries the zeros into the shape scale, so the viewer renders a 0x0 quad
+    and the floor is invisible. Resizing the collision plane itself is NOT an
+    option: a finite plane collides as a bounded quad, and a full-body impact
+    against it injects energy (>800 m/s runaway, robot tunnels through) where
+    the infinite half-space settles at ~20 m/s. Verified on both the sparse
+    articulation fork and the upstream vbd-sparse-direct branch; repro lives in
+    the vbd-stable-eval branch (repro_h2_impact_blowup.py --finite-floor).
+
+    Returns:
+        The number of visual quads that were added.
+    """
+    added = 0
+    cfg = newton.ModelBuilder.ShapeConfig()
+    cfg.density = 0.0
+    cfg.has_shape_collision = False
+    cfg.has_particle_collision = False
+    for si in range(len(builder.shape_type)):
+        if int(builder.shape_type[si]) != int(newton.GeoType.PLANE):
+            continue
+        scale = builder.shape_scale[si]
+        if scale[0] > 0.0 or scale[1] > 0.0:
+            continue
+        builder.add_shape_plane(
+            width=extent,
+            length=extent,
+            body=builder.shape_body[si],
+            xform=wp.transform(*builder.shape_transform[si]) if builder.shape_body[si] >= 0 else wp.transform(*builder.shape_transform[si]),
+            cfg=cfg,
+            label=f"{builder.shape_label[si].rsplit('/', 1)[-1]}_visual_quad",
+        )
+        added += 1
+    return added
 
 
 def _rest_pose_fk(builder: newton.ModelBuilder) -> None:
@@ -352,7 +443,12 @@ class Example:
         drive_group = getattr(args, "drive", "all")
         knee_amp = math.radians(getattr(args, "knee_amplitude_deg", 25.0))
         self.driven_joints = {}
-        if drive_group != "waist":
+        if drive_group == "none":
+            # Hold every motor at q=0 instead of leaving the cranks limp: the
+            # drop test wants a stiff statue, not a marionette.
+            for name in _DRIVEN_JOINTS:
+                self.driven_joints[name] = 0.0
+        elif drive_group != "waist":
             for name, amp in _DRIVEN_JOINTS.items():
                 if drive_group == "knee" and "knee_motor" not in name:
                     continue
@@ -360,6 +456,8 @@ class Example:
                     continue
                 self.driven_joints[name] = knee_amp if "knee_motor" in name else amp
         self.drive_waist = drive_group in ("all", "waist")
+        if drive_group == "none":
+            self.drive_waist = False
         self.waist_antiphase = getattr(args, "waist_antiphase", False)
         self.rocker_amplitude_deg = getattr(args, "rocker_amplitude_deg", 6.0)
         # Direct-drive the waist pitch joint (the URDF marks it effort=180,
@@ -369,15 +467,95 @@ class Example:
             self.driven_joints["waist_pitch_joint"] = math.radians(10.0)
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=getattr(args, "gravity", -9.81))
-        builder.add_urdf(
-            args.urdf,
-            xform=wp.transform(wp.vec3(0.0, 0.0, 1.2), wp.quat_identity()),
-            floating=False,
-            enable_self_collisions=False,
-        )
+        self.source = getattr(args, "source", "mjcf")
+        # Free base + ground turns the fixed-base linkage rig into a drop test,
+        # which is what you want when checking the foot colliders against the
+        # floor; the default rig hangs the pelvis with nothing to stand on.
+        self.floating = getattr(args, "floating", False)
+        # The MJCF already places the pelvis at 1.03 m and carries its own
+        # <geom name="floor"> at z=0, so it is imported unshifted; translating it
+        # would lift that floor along with the robot. The URDF has no ground and
+        # spawns at the origin, hence the 1.2 m default there.
+        spawn_z = getattr(args, "spawn_height", None)
+        if spawn_z is None:
+            spawn_z = 0.0 if self.source == "mjcf" else 1.2
+        # The broad phase pairs shapes per world; world -1 is the shared segment
+        # and is only tested against regular worlds, never against itself. With
+        # everything left at -1 (this builder's default) no candidate pairs
+        # exist at all, so the drop test's robot and floor must live in a
+        # regular world.
+        if self.floating:
+            builder.begin_world(label="h2")
+        if self.source == "mjcf":
+            # The MJCF is the collision authority: sole capsules plus a per-link
+            # collision whitelist. Its <equality><tendon> loops are skipped —
+            # the pushrods below reconstruct them as rigid bodies instead.
+            collision_view = getattr(args, "collision_view", False)
+            builder.add_mjcf(
+                args.mjcf,
+                xform=wp.transform(wp.vec3(0.0, 0.0, spawn_z), wp.quat_identity()),
+                floating=self.floating,
+                enable_self_collisions=False,
+                parse_sites=True,
+                skip_equality_constraints=True,
+                parse_visuals=not collision_view,
+                force_show_colliders=collision_view,
+            )
+        else:
+            builder.add_urdf(
+                args.urdf,
+                xform=wp.transform(wp.vec3(0.0, 0.0, spawn_z), wp.quat_identity()),
+                floating=self.floating,
+                enable_self_collisions=False,
+            )
 
         _rest_pose_fk(builder)
         self._bump_placeholder_masses(builder)
+
+        # With a floating base the importer drops the asset's base pose: the free
+        # joint's parent anchor stays at identity (the fixed-base path carries the
+        # pose in X_p instead), so the rest FK assembles the robot around the
+        # origin. Recover the pose from the MJCF's root <body pos> (plus the
+        # spawn offset) and shift every rest transform before the pushrods are
+        # anchored — the closed-loop graph forbids eval_fk, so states inherit
+        # body_q as-is and everything must be consistent here.
+        if self.floating:
+            base_p = [0.0, 0.0, spawn_z]
+            if self.source == "mjcf":
+                root_body = ET.parse(args.mjcf).getroot().find("./worldbody/body")
+                pos = [float(v) for v in root_body.get("pos", "0 0 0").split()]
+                base_p = [pos[0], pos[1], pos[2] + spawn_z]
+            base_tf = wp.transform(wp.vec3(*base_p), wp.quat_identity())
+            for bi in range(len(builder.body_q)):
+                builder.body_q[bi] = list(base_tf * wp.transform(*builder.body_q[bi]))
+            for j in range(len(builder.joint_type)):
+                if builder.joint_type[j] == newton.JointType.FREE:
+                    child = builder.joint_child[j]
+                    qs = builder.joint_q_start[j]
+                    builder.joint_q[qs : qs + 7] = list(builder.body_q[child])
+
+        # enable_self_collisions=False filters every shape pair inside the
+        # import — and the MJCF's floor is part of the import, so the foot-floor
+        # pairs land in the exclusion list too (18 robot shapes + 1 floor =
+        # C(19,2) = 171 filtered pairs, i.e. all of them). Strip the pairs that
+        # involve static geometry; self-collision stays off.
+        if self.floating:
+            static_shapes = {si for si, b in enumerate(builder.shape_body) if b < 0}
+            before = len(builder.shape_collision_filter_pairs)
+            builder.shape_collision_filter_pairs = type(builder.shape_collision_filter_pairs)(
+                pair
+                for pair in builder.shape_collision_filter_pairs
+                if pair[0] not in static_shapes and pair[1] not in static_shapes
+            )
+            removed = before - len(builder.shape_collision_filter_pairs)
+            if removed:
+                print(f"[sim_h2_loop] unfiltered {removed} static-vs-robot collision pairs")
+
+        extent = getattr(args, "ground_extent", 20.0)
+        if _size_infinite_planes(builder, extent):
+            print(f"[sim_h2_loop] added a {extent:g}x{extent:g} m visual quad over the MJCF floor (collision plane untouched)")
+        elif getattr(args, "ground", False):
+            builder.add_ground_plane()
 
         mjcf_path = getattr(args, "armature_mjcf", DEFAULT_MJCF)
         if mjcf_path:
@@ -390,14 +568,22 @@ class Example:
         }
         body_labels = builder.body_label
         self.loop_ball_labels = []
-        for link_a, marker_a, link_b, marker_b, rod_label in _LOOPS:
+        loops = _LOOPS_MJCF if self.source == "mjcf" else _LOOPS
+        for link_a, marker_a, link_b, marker_b, rod_label in loops:
             group = "ankle" if "ankle" in rod_label else ("knee" if "knee" in rod_label else "waist")
             b_a = _find(body_labels, link_a)
             b_b = _find(body_labels, link_b)
-            p_a = np.array(builder.body_q[_find(body_labels, marker_a)])[:3]
-            p_b = np.array(builder.body_q[_find(body_labels, marker_b)])[:3]
+            if self.source == "mjcf":
+                p_a = _site_world_pos(builder, marker_a)
+                p_b = _site_world_pos(builder, marker_b)
+            else:
+                p_a = np.array(builder.body_q[_find(body_labels, marker_a)])[:3]
+                p_b = np.array(builder.body_q[_find(body_labels, marker_b)])[:3]
             end_label = _add_pushrod(builder, b_a, p_a, b_b, p_b, rod_label, rod_type=rod_types[group])
             self.loop_ball_labels.append(end_label)
+
+        if self.floating:
+            builder.end_world()
 
         _single_closed_loop_articulation(builder, "h2_loops")
         builder.color()
@@ -407,6 +593,22 @@ class Example:
         # loop closure). _rest_pose_fk already assembled the rest pose, so the
         # finalized model (and states derived from it) start consistent.
         self.model = builder.finalize(skip_validation_joints=True)
+        # The linkage rig never needed contacts, but the drop test does:
+        # without a pipeline the solver receives contacts=None and the
+        # floor is decorative.
+        self.collision_pipeline = None
+        self.contacts = None
+        if self.floating:
+            # "explicit" broad phase (the default) only tests the pairs staged
+            # in model.shape_contact_pairs, and this standalone build stages
+            # none; nxn is cheap for a single robot plus a floor.
+            self.model.request_contact_attributes("force")
+            self.collision_pipeline = newton.CollisionPipeline(self.model, broad_phase="nxn")
+            self.contacts = self.collision_pipeline.contacts()
+            # Scratch buffer holding only the force-bearing subset for display:
+            # the narrow phase reports every candidate within gap_sum (0.2 m by
+            # default), so raw arrows also mark contacts carrying zero force.
+            self._display_contacts = self.collision_pipeline.contacts()
 
         self._configure_drives()
 
@@ -416,6 +618,9 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=getattr(args, "iterations", 8),
+            # A fallen torso mesh alone reaches ~200 plane contacts on one body;
+            # the 64-entry default silently drops the excess.
+            rigid_body_contact_buffer_size=getattr(args, "contact_buffer", 256),
             rigid_articulation_solve=solve_mode,
             rigid_joint_armature=solve_mode == "block_sparse_joints",
             rigid_articulation_level_parallel=getattr(args, "level_parallel", False),
@@ -431,6 +636,11 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+
+        self.frame_index = 0
+        self._pelvis_body = next(
+            i for i, lb in enumerate(self.model.body_label) if lb.rsplit("/", 1)[-1] == "pelvis"
+        )
         self.control = self.model.control()
         self.target_q = self.model.joint_target_q.numpy().copy()
 
@@ -516,16 +726,58 @@ class Example:
 
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
-            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            if self.collision_pipeline is not None:
+                self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
+        if self.floating:
+            # one line per rendered frame so viewer observations can be matched
+            # to a frame number
+            z = float(self.state_0.body_q.numpy()[self._pelvis_body][2])
+            n = int(self.contacts.rigid_contact_count.numpy()[0]) if self.contacts is not None else 0
+            loaded = getattr(self, "loaded_contact_count", -1)
+            print(
+                f"[frame {self.frame_index:5d}] t={self.sim_time:7.3f}s  pelvis_z={z:+.4f} m"
+                f"  candidates={n}  loaded={loaded}"
+            )
+        self.frame_index += 1
+
+    def _loaded_contacts(self):
+        """Compact the contact buffer down to entries with nonzero force."""
+        import numpy as np
+
+        c = self.contacts
+        self.solver.update_contacts(c, self.state_0)
+        n = min(int(c.rigid_contact_count.numpy()[0]), c.rigid_contact_max)
+        f = c.force.numpy()[:n]
+        keep = np.flatnonzero(np.linalg.norm(f[:, :3], axis=1) > 1e-6)
+        d = self._display_contacts
+        d.rigid_contact_count.assign(np.array([len(keep)], dtype=np.int32))
+        if len(keep):
+            d.rigid_contact_shape0.numpy()[: len(keep)]  # ensure allocation
+            d.rigid_contact_shape0.assign(
+                np.resize(c.rigid_contact_shape0.numpy()[:n][keep], d.rigid_contact_max)
+            )
+            d.rigid_contact_shape1.assign(
+                np.resize(c.rigid_contact_shape1.numpy()[:n][keep], d.rigid_contact_max)
+            )
+            d.rigid_contact_point0.assign(np.resize(c.rigid_contact_point0.numpy()[:n][keep], (d.rigid_contact_max, 3)))
+            d.rigid_contact_offset0.assign(
+                np.resize(c.rigid_contact_offset0.numpy()[:n][keep], (d.rigid_contact_max, 3))
+            )
+            d.rigid_contact_normal.assign(np.resize(c.rigid_contact_normal.numpy()[:n][keep], (d.rigid_contact_max, 3)))
+        return d, len(keep)
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        if self.contacts is not None:
+            display, self.loaded_contact_count = self._loaded_contacts()
+            self.viewer.log_contacts(display, self.state_0)
         self.viewer.end_frame()
 
     def test_final(self):
@@ -603,6 +855,44 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--source",
+            choices=["mjcf", "urdf"],
+            default="mjcf",
+            help="Asset to load. 'mjcf' brings the MJCF collision set (sole capsules + link whitelist).",
+        )
+        parser.add_argument("--mjcf", type=str, default=DEFAULT_MJCF, help="Path to H2loop_complete.xml.")
+        parser.add_argument(
+            "--floating",
+            action="store_true",
+            help="Give the pelvis a free joint instead of pinning it in the air.",
+        )
+        parser.add_argument(
+            "--ground",
+            action="store_true",
+            help="Add a collidable ground plane at z=0 (only needed for --source urdf; the MJCF ships one).",
+        )
+        parser.add_argument(
+            "--ground-extent", type=float, default=20.0, help="Drawn half-extent of the ground plane [m]."
+        )
+        parser.add_argument(
+            "--collision-view",
+            action="store_true",
+            help="Import only the collision geometry (no visual meshes) and force it visible.",
+        )
+        parser.add_argument(
+            "--contact-buffer",
+            type=int,
+            default=256,
+            help="Per-body rigid contact list capacity (solver default is 64).",
+        )
+        parser.add_argument(
+            "--spawn-height",
+            type=float,
+            default=None,
+            help="Extra height applied to the imported asset [m]. Defaults to 0 for mjcf (it already "
+            "positions the pelvis and its floor) and 1.2 for urdf.",
+        )
         parser.add_argument("--urdf", type=str, default=DEFAULT_URDF, help="Path to H2_loop.urdf.")
         parser.add_argument(
             "--armature_mjcf",
@@ -618,7 +908,7 @@ class Example:
             "--level-parallel", action="store_true", help="Use the level-scheduled block-sparse solve kernel."
         )
         parser.add_argument(
-            "--drive", choices=["all", "knee", "ankle", "waist"], default="all", help="Which cranks to drive."
+            "--drive", choices=["all", "knee", "ankle", "waist", "none"], default="all", help="Which cranks to drive."
         )
         parser.add_argument("--knee-amplitude-deg", type=float, default=25.0)
         parser.add_argument("--ankle-rod", choices=["ss", "su"], default="ss", help="Ankle rod ends (spatial loop).")
