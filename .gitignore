@@ -74,3 +74,4 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+sim2sim_out/
