@@ -115,12 +115,13 @@ different output names.
 ## Reproduce unoptimized VBD
 
 Use the same benchmark harness with the unoptimized solver; dropping the level
-flag alone is not sufficient. From the optimization commit, prepare an isolated
-detached checkout of its parent and copy only the current H2 harness and local
-robot assets into it. The solver files remain unmodified:
+flag alone is not sufficient. Prepare an isolated detached checkout of the
+unoptimized implementation and copy only the current H2 harness and local
+robot assets into it. Use the explicit revision below, not `HEAD^`, so later
+analysis commits do not change the baseline. The solver files remain unmodified:
 
 ```sh
-git worktree add --detach sim2sim_out/vbd_baseline HEAD^
+git worktree add --detach sim2sim_out/vbd_baseline 61f613dac293268e441246e551366ff01f761f35
 git archive HEAD h2_sim2sim | tar -x -C sim2sim_out/vbd_baseline
 cp -R h2_description sim2sim_out/vbd_baseline/h2_description
 

@@ -1,0 +1,173 @@
+{
+  "backend": "vbd",
+  "steps": 476,
+  "repeats": 3,
+  "seed": 42,
+  "sampling_dt": 0.02,
+  "auto_reset": false,
+  "keep_running": true,
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+  "versions": {
+    "warp-lang": "1.16.0.dev20260716",
+    "numpy": "2.5.1",
+    "torch": "2.9.0+cu128",
+    "mujoco": "3.11.0"
+  },
+  "input_sha256": {
+    "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+    "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a",
+    "H2loop_complete.xml": "5803ce64b4207867195128d5c94edb21c6265096c64475d7fc34a656e669e10e"
+  },
+  "configuration": {
+    "level_parallel": true,
+    "physics_dt": 0.005,
+    "decimation": 4,
+    "iterations": 8,
+    "cuda_graph": true,
+    "statuses": [
+      {
+        "first_threshold": {
+          "time_s": 5.84,
+          "reason": "ee_body_pos"
+        },
+        "finite": true,
+        "pelvis_z_min_median_max": [
+          1.0280252695083618,
+          1.0280252695083618,
+          1.0280252695083618
+        ],
+        "pelvis_below_0_5m_count": 0
+      },
+      {
+        "first_threshold": {
+          "time_s": 5.84,
+          "reason": "ee_body_pos"
+        },
+        "finite": true,
+        "pelvis_z_min_median_max": [
+          1.0280252695083618,
+          1.0280252695083618,
+          1.0280252695083618
+        ],
+        "pelvis_below_0_5m_count": 0
+      },
+      {
+        "first_threshold": {
+          "time_s": 5.84,
+          "reason": "ee_body_pos"
+        },
+        "finite": true,
+        "pelvis_z_min_median_max": [
+          1.0280252695083618,
+          1.0280252695083618,
+          1.0280252695083618
+        ],
+        "pelvis_below_0_5m_count": 0
+      }
+    ]
+  },
+  "statistics": {
+    "all_loops": {
+      "mean_abs_mm": 0.019621678591454268,
+      "rms_mm": 0.039886877554831314,
+      "p95_abs_mm": 0.062069237868928005,
+      "max_abs_mm": 0.5342157283394766
+    },
+    "per_loop": {
+      "left_ankle_rod_tendon": {
+        "mean_abs_mm": 0.008573727017022728,
+        "rms_mm": 0.011417268842451209,
+        "p95_abs_mm": 0.02417135915558085,
+        "max_abs_mm": 0.03769807849485218
+      },
+      "right_ankle_rod_tendon": {
+        "mean_abs_mm": 0.01382902787117279,
+        "rms_mm": 0.018230865354075212,
+        "p95_abs_mm": 0.037117746200179824,
+        "max_abs_mm": 0.07785566778883979
+      },
+      "left_knee_rod_tendon": {
+        "mean_abs_mm": 0.03165627804763173,
+        "rms_mm": 0.05071957464160693,
+        "p95_abs_mm": 0.0770441228332724,
+        "max_abs_mm": 0.3513876221280521
+      },
+      "right_knee_rod_tendon": {
+        "mean_abs_mm": 0.03921550910387006,
+        "rms_mm": 0.06398495041114663,
+        "p95_abs_mm": 0.11963721399452922,
+        "max_abs_mm": 0.5342157283394766
+      },
+      "right_waist_rod_tendon": {
+        "mean_abs_mm": 0.015620506379421273,
+        "rms_mm": 0.04621874411261884,
+        "p95_abs_mm": 0.057832743062562815,
+        "max_abs_mm": 0.36688503223171465
+      },
+      "left_waist_rod_tendon": {
+        "mean_abs_mm": 0.008835023129607024,
+        "rms_mm": 0.01674329981739682,
+        "p95_abs_mm": 0.03807984614904225,
+        "max_abs_mm": 0.1124405767477521
+      }
+    },
+    "per_repeat": [
+      {
+        "mean_abs_mm": 0.019621678591454268,
+        "rms_mm": 0.039886877554831314,
+        "p95_abs_mm": 0.06203332471252376,
+        "max_abs_mm": 0.5342157283394766
+      },
+      {
+        "mean_abs_mm": 0.019621678591454268,
+        "rms_mm": 0.039886877554831314,
+        "p95_abs_mm": 0.06203332471252376,
+        "max_abs_mm": 0.5342157283394766
+      },
+      {
+        "mean_abs_mm": 0.019621678591454268,
+        "rms_mm": 0.039886877554831314,
+        "p95_abs_mm": 0.06203332471252376,
+        "max_abs_mm": 0.5342157283394766
+      }
+    ],
+    "initial_error_mm": [
+      [
+        6.422944398565278e-07,
+        8.745421997691238e-06,
+        -3.8816008296471693e-05,
+        3.197970360746538e-06,
+        1.9355295380329984e-05,
+        5.917674410216289e-05
+      ],
+      [
+        6.422944398565278e-07,
+        8.745421997691238e-06,
+        -3.8816008296471693e-05,
+        3.197970360746538e-06,
+        1.9355295380329984e-05,
+        5.917674410216289e-05
+      ],
+      [
+        6.422944398565278e-07,
+        8.745421997691238e-06,
+        -3.8816008296471693e-05,
+        3.197970360746538e-06,
+        1.9355295380329984e-05,
+        5.917674410216289e-05
+      ]
+    ],
+    "peak": {
+      "repeat": 0,
+      "time_s": 6.04,
+      "loop": "right_knee_rod_tendon",
+      "signed_mm": 0.5342157283394766
+    },
+    "ball_gap": {
+      "mean_abs_mm": 0.009838901431930912,
+      "rms_mm": 0.019959260175276185,
+      "p95_abs_mm": 0.031126824761181206,
+      "max_abs_mm": 0.2672962737818259
+    }
+  }
+}

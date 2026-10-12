@@ -12,6 +12,7 @@ See [BENCHMARK.md](BENCHMARK.md) for mjlab and VBD throughput at 1024, 4096
 and 8192 environments, optimization settings and benchmark reproduction commands.
 The batch benchmark supports an opt-in CUDA level schedule; the single-environment
 recorder below uses the default schedule and does not capture CUDA graphs.
+See [CLOSURE.md](CLOSURE.md) for per-loop constraint-error measurements and curves.
 
 ## Configuration
 
