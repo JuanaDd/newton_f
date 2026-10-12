@@ -689,6 +689,8 @@ def main():
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
+    # The optimized sparse assembly can trigger an NVRTC precompiled-header crash.
+    wp.config.use_precompiled_headers = False
     wp.init()
     motion = Motion(str(args.motion))
     if not np.isclose(motion.fps, 50):

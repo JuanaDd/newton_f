@@ -51,8 +51,10 @@ from .rigid_sparse_articulation_kernels import (
     apply_articulation_sparse_delta_scalar,
     assemble_articulation_body_diagonal_scalar,
     assemble_articulation_joints_scalar,
+    gather_articulation_joint_diagonals_scalar,
     mat66f,
     regularize_articulation_body_hessian,
+    solve_articulation_sparse_block32_level,
     solve_articulation_sparse_block32_scalar,
     solve_articulation_sparse_serial,
     vec6f,
@@ -285,6 +287,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-cable angular joint constraints
         rigid_joint_armature: bool = False,
+        rigid_articulation_level_parallel: bool = False,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: controlled by model attributes
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
@@ -406,6 +409,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_joint_armature: Whether the experimental block-sparse articulation solve includes revolute
                 joint armature as coupled relative-coordinate inertia. This option is only supported with
                 ``rigid_articulation_solve="block_sparse_joints"``.
+            rigid_articulation_level_parallel: Opt into elimination-level scheduling for the CUDA
+                block-sparse solve. The default uses the serial pivot schedule. CPU solves are unchanged.
+                Floating-point accumulation order may differ between schedules.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is controlled
                 by ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
             rigid_articulation_solve: Rigid articulation solve mode. ``"local"`` uses the existing
@@ -531,6 +537,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_joint_armature = rigid_joint_armature
+        self.rigid_articulation_level_parallel = rigid_articulation_level_parallel
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
@@ -607,6 +614,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     )
                     self.rigid_articulation_sparse_delta_scalar = wp.zeros(
                         self.rigid_articulation_sparse_layout.articulation_body_count * 6,
+                        dtype=float,
+                        device=self.device,
+                    )
+                    # Two diagonal blocks and two six-component RHS vectors per joint.
+                    self.rigid_articulation_joint_scratch = wp.zeros(
+                        self.rigid_articulation_sparse_layout.articulation_joint_count * 84,
                         dtype=float,
                         device=self.device,
                     )
@@ -3279,6 +3292,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_hessian_aa,
                 ],
                 device=self.device,
+                block_dim=128,
             )
 
         if self.rigid_articulation_diagonal_regularization > 0.0:
@@ -3437,9 +3451,28 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_joint_armature,
                     self.rigid_joint_alpha,
                 ],
-                outputs=[self.rigid_articulation_sparse_values_scalar, self.rigid_articulation_sparse_rhs_scalar],
+                outputs=[
+                    self.rigid_articulation_sparse_values_scalar,
+                    self.rigid_articulation_joint_scratch,
+                ],
                 device=self.device,
                 block_dim=128,
+            )
+
+            # Phase 2 of the two-phase assembly: exclusive per-body gather of the
+            # joints' diagonal/rhs scratch contributions (no atomics).
+            wp.launch(
+                kernel=gather_articulation_joint_diagonals_scalar,
+                dim=(layout.articulation_body_count, 42),
+                inputs=[
+                    layout.body_joint_offsets,
+                    layout.body_joint_entries,
+                    self.rigid_articulation_joint_scratch,
+                    self.rigid_articulation_sparse_values_scalar,
+                    self.rigid_articulation_sparse_rhs_scalar,
+                    layout.articulation_diag_slots,
+                ],
+                device=self.device,
             )
 
         if not use_block32:
@@ -3462,28 +3495,56 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
 
         if use_block32:
-            wp.launch(
-                kernel=solve_articulation_sparse_block32_scalar,
-                dim=layout.articulation_count * 128,
-                inputs=[
-                    layout.articulation_body_offsets,
-                    layout.articulation_block_row_offsets,
-                    layout.articulation_block_cols,
-                    layout.articulation_block_col_offsets,
-                    layout.articulation_block_col_rows,
-                    layout.articulation_block_col_slots,
-                    layout.articulation_schur_offsets,
-                    layout.articulation_schur_dst_slots,
-                    layout.articulation_schur_left_slots,
-                    layout.articulation_schur_right_slots,
-                    layout.articulation_diag_slots,
-                    self.rigid_articulation_sparse_values_scalar,
-                    self.rigid_articulation_sparse_rhs_scalar,
-                ],
-                outputs=[self.rigid_articulation_sparse_delta_scalar],
-                device=self.device,
-                block_dim=128,
-            )
+            if self.rigid_articulation_level_parallel:
+                # Four warps share independent pivots within each tree level.
+                wp.launch(
+                    kernel=solve_articulation_sparse_block32_level,
+                    dim=layout.articulation_count * 128,
+                    inputs=[
+                        layout.articulation_body_offsets,
+                        layout.articulation_block_row_offsets,
+                        layout.articulation_block_cols,
+                        layout.articulation_block_col_offsets,
+                        layout.articulation_block_col_rows,
+                        layout.articulation_block_col_slots,
+                        layout.articulation_schur_offsets,
+                        layout.articulation_schur_dst_slots,
+                        layout.articulation_schur_left_slots,
+                        layout.articulation_schur_right_slots,
+                        layout.articulation_diag_slots,
+                        layout.articulation_level_offsets,
+                        layout.articulation_level_starts,
+                        layout.articulation_level_bodies,
+                        self.rigid_articulation_sparse_values_scalar,
+                        self.rigid_articulation_sparse_rhs_scalar,
+                    ],
+                    outputs=[self.rigid_articulation_sparse_delta_scalar],
+                    device=self.device,
+                    block_dim=128,
+                )
+            else:
+                wp.launch(
+                    kernel=solve_articulation_sparse_block32_scalar,
+                    dim=layout.articulation_count * 128,
+                    inputs=[
+                        layout.articulation_body_offsets,
+                        layout.articulation_block_row_offsets,
+                        layout.articulation_block_cols,
+                        layout.articulation_block_col_offsets,
+                        layout.articulation_block_col_rows,
+                        layout.articulation_block_col_slots,
+                        layout.articulation_schur_offsets,
+                        layout.articulation_schur_dst_slots,
+                        layout.articulation_schur_left_slots,
+                        layout.articulation_schur_right_slots,
+                        layout.articulation_diag_slots,
+                        self.rigid_articulation_sparse_values_scalar,
+                        self.rigid_articulation_sparse_rhs_scalar,
+                    ],
+                    outputs=[self.rigid_articulation_sparse_delta_scalar],
+                    device=self.device,
+                    block_dim=128,
+                )
 
             wp.launch(
                 kernel=apply_articulation_sparse_delta_scalar,

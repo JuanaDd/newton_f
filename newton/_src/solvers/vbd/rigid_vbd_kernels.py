@@ -3576,6 +3576,10 @@ def accumulate_body_body_contacts_per_body(
     if num_contacts > body_contact_buffer_pre_alloc:
         num_contacts = body_contact_buffer_pre_alloc
 
+    # Empty strided lanes would only issue zero-valued atomic additions.
+    if thread_id_within_body >= num_contacts:
+        return
+
     contact_count = rigid_contact_count[0]
 
     force_acc = wp.vec3(0.0)

@@ -10,7 +10,14 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import _joint_projectors
+from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
+    _cholesky66_warp,
+    _joint_projectors,
+    _lower_solve66_warp,
+    _right_solve_lower_transpose66_warp,
+    _upper_solve66_warp,
+    _warp_sync,
+)
 from newton.examples.cable import example_cable_cross_slide_table
 
 
@@ -23,6 +30,19 @@ def _evaluate_angular_projector(
 ):
     _, P_ang = _joint_projectors(joint_type, joint_axis, 0, 0, 1, parent_anchor_q)
     angular_projector[0] = P_ang
+
+
+@wp.kernel
+def _solve_cooperative_blocks(values: wp.array[float], rhs: wp.array[float]):
+    tid = wp.tid()
+    block = tid // 32
+    lane = tid % 32
+    _cholesky66_warp(values, block * 2, lane)
+    _warp_sync()
+    _right_solve_lower_transpose66_warp(values, block * 2 + 1, block * 2, lane)
+    _lower_solve66_warp(values, block * 2, rhs, block, lane)
+    _warp_sync()
+    _upper_solve66_warp(values, block * 2, rhs, block, lane)
 
 
 def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -720,7 +740,7 @@ def _solve_residual(mode: str) -> float:
     return _joint_residual(model, state_out)
 
 
-def _solve_loop_q(mode: str, device: str) -> np.ndarray:
+def _solve_loop_q(mode: str, device: str, *, level_parallel: bool = False) -> np.ndarray:
     model = _make_loop_model(device)
     state_in = model.state()
     state_out = model.state()
@@ -732,6 +752,7 @@ def _solve_loop_q(mode: str, device: str) -> np.ndarray:
         model,
         iterations=1,
         rigid_articulation_solve=mode,
+        rigid_articulation_level_parallel=level_parallel,
         rigid_articulation_relaxation=1.0,
         rigid_avbd_alpha=0.0,
     )
@@ -779,6 +800,29 @@ def _solve_offset_com_single_body_q(mode: str) -> np.ndarray:
 
 
 class TestVBDSparseArticulation(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA device required")
+    def test_sparse_level_parallel_matches_serial(self):
+        """Match the serial sparse solve with the opt-in level schedule."""
+        results = []
+        for parallel in (False, True):
+            model = _make_loop_model("cuda:0")
+            state_in, state_out = model.state(), model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+            _perturb_body_poses(state_in, translation_amplitude=0.02, rotation_amplitude=0.0)
+            solver = newton.solvers.SolverVBD(
+                model,
+                iterations=8,
+                rigid_articulation_solve="block_sparse_joints",
+                rigid_articulation_level_parallel=parallel,
+                rigid_avbd_alpha=0.0,
+            )
+            control = model.control()
+            for _ in range(4):
+                solver.step(state_in, state_out, control, None, 0.005)
+                state_in, state_out = state_out, state_in
+            results.append(state_in.body_q.numpy())
+        np.testing.assert_allclose(results[1], results[0], rtol=2e-4, atol=2e-4)
+
     def test_builder_accepts_closed_loop_articulation(self):
         builder = newton.ModelBuilder(gravity=0.0)
         inertia = wp.mat33(np.eye(3, dtype=np.float32))
@@ -833,9 +877,32 @@ class TestVBDSparseArticulation(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA device required")
     def test_sparse_articulation_cuda_matches_cpu_serial(self):
+        """Compare both CUDA elimination schedules against the CPU closed-loop solve."""
         cpu_q = _solve_loop_q("block_sparse_joints", "cpu")
-        cuda_q = _solve_loop_q("block_sparse_joints", "cuda:0")
-        np.testing.assert_allclose(cuda_q, cpu_q, rtol=2.0e-4, atol=2.0e-4)
+        for level_parallel in (False, True):
+            with self.subTest(level_parallel=level_parallel):
+                cuda_q = _solve_loop_q("block_sparse_joints", "cuda:0", level_parallel=level_parallel)
+                np.testing.assert_allclose(cuda_q, cpu_q, rtol=2.0e-4, atol=2.0e-4)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA device required")
+    def test_cooperative_blocks_match_numpy(self):
+        """Check factorization and both triangular solve directions against float64 NumPy."""
+        rng = np.random.default_rng(42)
+        count = 256
+        factors = rng.normal(size=(count, 6, 6))
+        matrices = (factors @ factors.transpose(0, 2, 1) + np.eye(6) * 0.2).astype(np.float32)
+        right = rng.normal(size=(count, 6, 6)).astype(np.float32)
+        rhs = rng.normal(size=(count, 6)).astype(np.float32)
+        values = wp.array(np.stack((matrices, right), axis=1).ravel(), device="cuda:0")
+        result = wp.array(rhs.ravel(), device="cuda:0")
+        wp.launch(_solve_cooperative_blocks, dim=count * 32, inputs=[values, result], block_dim=32, device="cuda:0")
+        actual = values.numpy().reshape(count, 2, 6, 6)
+        expected_chol = np.linalg.cholesky(matrices.astype(np.float64))
+        expected_solve = np.linalg.solve(matrices.astype(np.float64), rhs[..., None].astype(np.float64))[..., 0]
+        expected_right = np.linalg.solve(expected_chol, right.transpose(0, 2, 1)).transpose(0, 2, 1)
+        np.testing.assert_allclose(actual[:, 0], expected_chol, atol=2.0e-5, rtol=2.0e-5)
+        np.testing.assert_allclose(actual[:, 1], expected_right, atol=2.0e-5, rtol=2.0e-5)
+        np.testing.assert_allclose(result.numpy().reshape(count, 6), expected_solve, atol=4.0e-5, rtol=4.0e-5)
 
     def test_sparse_articulation_default_relaxation_is_tuned(self):
         model = _make_single_body_model()

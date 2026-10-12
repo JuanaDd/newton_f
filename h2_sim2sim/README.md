@@ -8,6 +8,11 @@ replay. The motion NPZ supplies the reference motion to track.
 This package provides inference, trajectory recording and recorded-pose overlay
 rendering. It does not train a policy or include robot assets or policy weights.
 
+See [BENCHMARK.md](BENCHMARK.md) for mjlab and VBD throughput at 1024, 4096
+and 8192 environments, optimization settings and benchmark reproduction commands.
+The batch benchmark supports an opt-in CUDA level schedule; the single-environment
+recorder below uses the default schedule and does not capture CUDA graphs.
+
 ## Configuration
 
 | Setting | Value |
@@ -106,3 +111,5 @@ uv run --no-project --python "$H2_PYTHON" python -m unittest h2_sim2sim.test_tra
 
 The interface tests check policy dimensions, original PD parameters and anchor
 orientation encoding. They do not measure full-trajectory tracking accuracy.
+The batched-observation test additionally requires CUDA and the `H2_CHECKPOINT`
+and `H2_MOTION` environment variables; see the benchmark checks for that command.
