@@ -74,3 +74,10 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+sim2sim_out/
+
+# External H2 robot assets, motion references, and policy checkpoints
+/h2_description/
+/sim2sim_inputs/
+*.pt
+*.pth
