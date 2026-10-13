@@ -1,0 +1,544 @@
+{
+  "measurement_date": "2026-10-13",
+  "description": "Aligned manager-free H2 inference; physics includes MJWarp final forward",
+  "validation": {
+    "num_envs": 8,
+    "control_frames": 476,
+    "full_rollouts": 3,
+    "minimal_rollouts": 2,
+    "same_state_observation_max_abs": 0.0,
+    "same_state_action_max_abs": 0.0,
+    "full_full_body_position_rms_m": [0.013096999377012253, 0.014790873974561691, 0.011476368643343449],
+    "full_full_body_position_max_m": 0.05175317823886871,
+    "minimal_full_body_position_rms_m": [0.011458490043878555, 0.014806974679231644, 0.013231402263045311, 0.01620413176715374, 0.013246624730527401, 0.01479380950331688],
+    "minimal_full_body_position_max_m": 0.05151459574699402,
+    "subsequent_full_h2_suite_tests_passed": 18
+  },
+  "runs": [
+    {
+      "policy_play": {
+        "seconds": [
+          1.9834201040212065,
+          1.9812993700033985,
+          1.9841810290236026
+        ],
+        "env_fps": [
+          206511.9735196657,
+          206733.0188467669,
+          206432.77705440033
+        ],
+        "median_env_fps": 206511.9735196657,
+        "median_batch_fps": 201.67184914029855,
+        "median_physics_env_steps_per_s": 826047.8940786629
+      },
+      "physics_cuda": {
+        "seconds": [
+          1.90986288189888,
+          1.9078072030544282,
+          1.910823005914688
+        ],
+        "env_fps": [
+          214465.65818000265,
+          214696.74679088336,
+          214357.89643108752
+        ],
+        "median_env_fps": 214465.65818000265,
+        "median_batch_fps": 209.43911931640883,
+        "median_physics_env_steps_per_s": 857862.6327200106
+      },
+      "status": [
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0308048725128174,
+            1.0312647819519043,
+            1.0314016342163086
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0308047533035278,
+            1.0312646627426147,
+            1.0314019918441772
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0308046340942383,
+            1.0312649011611938,
+            1.0314016342163086
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "physics_dt": 0.005,
+      "iterations": 100,
+      "ls_iterations": 50,
+      "physics_scope": "GPU target conversion + four MuJoCo Warp steps + final forward + frame advance",
+      "play_scope": "194 actor observations + shared Torch actor + physics; no rewards/termination/reset managers or rendering",
+      "cuda_graphs": "separate actor-observation and four-substep-plus-forward graphs; actor outside graphs",
+      "backend": "mjlab",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 1024,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    },
+    {
+      "policy_play": {
+        "seconds": [
+          6.214136780006811,
+          6.200433197023813,
+          6.212694365996867
+        ],
+        "env_fps": [
+          65914.22340715697,
+          66059.90049156672,
+          65929.52684777323
+        ],
+        "median_env_fps": 65929.52684777323,
+        "median_batch_fps": 64.38430356227855,
+        "median_physics_env_steps_per_s": 263718.1073910929
+      },
+      "physics_cuda": {
+        "seconds": [
+          6.154495873451233,
+          6.140838795661926,
+          6.153073044776916
+        ],
+        "env_fps": [
+          66552.97337461861,
+          66700.98558674978,
+          66568.36299833823
+        ],
+        "median_env_fps": 66568.36299833823,
+        "median_batch_fps": 65.00816699056467,
+        "median_physics_env_steps_per_s": 266273.4519933529
+      },
+      "status": [
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0256011486053467,
+            1.0261766910552979,
+            1.0263779163360596
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255999565124512,
+            1.0261776447296143,
+            1.0264830589294434
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0256003141403198,
+            1.0261770486831665,
+            1.0263745784759521
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "level_parallel": true,
+      "physics_scope": "GPU target conversion + clear forces + collision + 4 VBD steps",
+      "play_scope": "GPU IK/194 observations + actor + physics; no rewards/termination/reset managers or rendering",
+      "backend": "vbd",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 1024,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    },
+    {
+      "policy_play": {
+        "seconds": [
+          4.413515970984008,
+          4.4112379170255736,
+          4.413381708029192
+        ],
+        "env_fps": [
+          371223.3083037226,
+          371415.01565273694,
+          371234.60157984664
+        ],
+        "median_env_fps": 371234.60157984664,
+        "median_batch_fps": 90.63344765132975,
+        "median_physics_env_steps_per_s": 1484938.4063193866
+      },
+      "physics_cuda": {
+        "seconds": [
+          4.2893474898338315,
+          4.287094344139099,
+          4.289792995452881
+        ],
+        "env_fps": [
+          381969.51957918226,
+          382170.26929670025,
+          381929.8510992676
+        ],
+        "median_env_fps": 381969.51957918226,
+        "median_batch_fps": 93.2542772410113,
+        "median_physics_env_steps_per_s": 1527878.078316729
+      },
+      "status": [
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.030571460723877,
+            1.0312646627426147,
+            1.031411051750183
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0305689573287964,
+            1.0312646627426147,
+            1.031402826309204
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.030569314956665,
+            1.0312646627426147,
+            1.0314120054244995
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "physics_dt": 0.005,
+      "iterations": 100,
+      "ls_iterations": 50,
+      "physics_scope": "GPU target conversion + four MuJoCo Warp steps + final forward + frame advance",
+      "play_scope": "194 actor observations + shared Torch actor + physics; no rewards/termination/reset managers or rendering",
+      "cuda_graphs": "separate actor-observation and four-substep-plus-forward graphs; actor outside graphs",
+      "backend": "mjlab",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 4096,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    },
+    {
+      "policy_play": {
+        "seconds": [
+          23.526993623003364,
+          23.57784908200847,
+          23.63160547800362
+        ],
+        "env_fps": [
+          69639.1568873494,
+          69488.95101929431,
+          69330.87984754266
+        ],
+        "median_env_fps": 69488.95101929431,
+        "median_batch_fps": 16.9650759324449,
+        "median_physics_env_steps_per_s": 277955.80407717725
+      },
+      "physics_cuda": {
+        "seconds": [
+          23.43451229095459,
+          23.485003368377686,
+          23.53868639755249
+        ],
+        "env_fps": [
+          69913.9789921039,
+          69763.66893802914,
+          69604.56383710341
+        ],
+        "median_env_fps": 69763.66893802914,
+        "median_batch_fps": 17.03214573682352,
+        "median_physics_env_steps_per_s": 279054.67575211654
+      },
+      "status": [
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.025571346282959,
+            1.026177167892456,
+            1.0264488458633423
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255722999572754,
+            1.0261775255203247,
+            1.0264406204223633
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255717039108276,
+            1.0261774063110352,
+            1.0264524221420288
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "level_parallel": true,
+      "physics_scope": "GPU target conversion + clear forces + collision + 4 VBD steps",
+      "play_scope": "GPU IK/194 observations + actor + physics; no rewards/termination/reset managers or rendering",
+      "backend": "vbd",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 4096,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    },
+    {
+      "policy_play": {
+        "seconds": [
+          7.826212549000047,
+          7.831824857043102,
+          7.835978980001528
+        ],
+        "env_fps": [
+          418695.50302702625,
+          418395.4646346819,
+          418173.6587557004
+        ],
+        "median_env_fps": 418395.4646346819,
+        "median_batch_fps": 51.073665116538315,
+        "median_physics_env_steps_per_s": 1673581.8585387275
+      },
+      "physics_cuda": {
+        "seconds": [
+          7.633398941040039,
+          7.637113991737365,
+          7.641479238510132
+        ],
+        "env_fps": [
+          429271.419627066,
+          429062.60186049173,
+          428817.496943024
+        ],
+        "median_env_fps": 429062.60186049173,
+        "median_batch_fps": 52.37580589117331,
+        "median_physics_env_steps_per_s": 1716250.407441967
+      },
+      "status": [
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0305206775665283,
+            1.0312644243240356,
+            1.0315288305282593
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0305216312408447,
+            1.0312644243240356,
+            1.031528115272522
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "termination_checks": false,
+          "auto_reset": false,
+          "pelvis_z_min_median_max": [
+            1.0305252075195312,
+            1.0312644243240356,
+            1.0315539836883545
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "physics_dt": 0.005,
+      "iterations": 100,
+      "ls_iterations": 50,
+      "physics_scope": "GPU target conversion + four MuJoCo Warp steps + final forward + frame advance",
+      "play_scope": "194 actor observations + shared Torch actor + physics; no rewards/termination/reset managers or rendering",
+      "cuda_graphs": "separate actor-observation and four-substep-plus-forward graphs; actor outside graphs",
+      "backend": "mjlab",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 8192,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    },
+    {
+      "policy_play": {
+        "seconds": [
+          47.29009315598523,
+          47.73611110303318,
+          47.833988287020475
+        ],
+        "env_fps": [
+          69291.46849407876,
+          68644.05005525869,
+          68503.59163735347
+        ],
+        "median_env_fps": 68644.05005525869,
+        "median_batch_fps": 8.37940064151107,
+        "median_physics_env_steps_per_s": 274576.20022103476
+      },
+      "physics_cuda": {
+        "seconds": [
+          47.13655356597901,
+          47.581980674743654,
+          47.67969635009766
+        ],
+        "env_fps": [
+          69517.1740847223,
+          68866.40601195725,
+          68725.26989139033
+        ],
+        "median_env_fps": 68866.40601195725,
+        "median_batch_fps": 8.4065437026315,
+        "median_physics_env_steps_per_s": 275465.624047829
+      },
+      "status": [
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255721807479858,
+            1.0261775255203247,
+            1.0264487266540527
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255717039108276,
+            1.026157259941101,
+            1.0264476537704468
+          ],
+          "pelvis_below_0_5m_count": 0
+        },
+        {
+          "finite": true,
+          "pelvis_z_min_median_max": [
+            1.0255697965621948,
+            1.0261768102645874,
+            1.026447057723999
+          ],
+          "pelvis_below_0_5m_count": 0
+        }
+      ],
+      "level_parallel": true,
+      "physics_scope": "GPU target conversion + clear forces + collision + 4 VBD steps",
+      "play_scope": "GPU IK/194 observations + actor + physics; no rewards/termination/reset managers or rendering",
+      "backend": "vbd",
+      "timing_protocol": "aligned_minimal_rollout_v2",
+      "num_envs": 8192,
+      "warmup": 40,
+      "steps": 400,
+      "repeats": 3,
+      "control_dt": 0.02,
+      "use_precompiled_headers": false,
+      "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+      "python": "3.13.15",
+      "versions": {
+        "warp-lang": "1.16.0.dev20260716",
+        "numpy": "2.5.1",
+        "torch": "2.9.0+cu128"
+      },
+      "sha256": {
+        "model_29999.pt": "99534239b1b0eaeb8a99bd12db856aab831d236a89c61012724e6d2b76df18d2",
+        "h2_360dankou.npz": "95370380434a609bb91e19617b6592051b3b8fea05ed947fb95446f6f6d2d52a"
+      }
+    }
+  ]
+}

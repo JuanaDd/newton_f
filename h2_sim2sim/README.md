@@ -10,6 +10,9 @@ rendering. It does not train a policy or include robot assets or policy weights.
 
 See [BENCHMARK.md](BENCHMARK.md) for mjlab and VBD throughput at 1024, 4096
 and 8192 environments, optimization settings and benchmark reproduction commands.
+The benchmark compares manager-free actor rollout on both backends and includes
+MuJoCo Warp's final `forward()` in physics time; it is not full mjlab training
+or task-manager throughput. The normal recording path below is unchanged.
 The batch benchmark supports an opt-in CUDA level schedule; the single-environment
 recorder below uses the default schedule and does not capture CUDA graphs.
 See [CLOSURE.md](CLOSURE.md) for per-loop constraint-error measurements and curves.
